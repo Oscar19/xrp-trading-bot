@@ -202,7 +202,7 @@ def detectar_ruptura_1h(rsi_values, diagonal, umbral=0.02):
     val_diag_1 = diagonal['m'] * (n-1) + diagonal['b']
     
     rsi_2 = rsi_values[-2]
-n    rsi_1 = rsi_values[-1]
+    rsi_1 = rsi_values[-1]
     
     # Ruptura: anterior <= diagonal, actual > diagonal
     ruptura = rsi_2 <= val_diag_2 and rsi_1 > val_diag_1
