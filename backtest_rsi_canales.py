@@ -1,7 +1,7 @@
 """
-BOT RSI CANALES - BACKTEST COMPLETO
-====================================
-Revisa todo el histórico y cuenta señales
+BOT RSI CANALES - BACKTEST COMPLETO CON RESULTADOS
+===================================================
+Revisa todo el histórico, simula trades y calcula métricas
 """
 
 import pandas as pd
@@ -15,6 +15,10 @@ from scipy import stats
 CONFIG = {
     'symbol': os.environ.get('BITGET_SYMBOL', 'XRP/USDT'),
     'balance': float(os.environ.get('BALANCE', '1000')),
+    'leverage': int(os.environ.get('LEVERAGE', '5')),
+    'risk_per_trade': float(os.environ.get('RISK_PER_TRADE', '0.02')),
+    'sl_pct': float(os.environ.get('SL_PCT', '0.015')),
+    'tp_pct': float(os.environ.get('TP_PCT', '0.03')),
     'min_r2_canal': float(os.environ.get('MIN_R2_CANAL', '0.3')),
     'min_r2_diagonal': float(os.environ.get('MIN_R2_DIAGONAL', '0.3')),
     'umbral_rebote': float(os.environ.get('UMBRAL_REBOTE', '1.15')),
@@ -23,13 +27,10 @@ CONFIG = {
 def log(msg):
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
 
-def fetch_data(exchange, symbol, timeframe, since=None, limit=1000):
+def fetch_data(exchange, symbol, timeframe, limit=1000):
     """Descargar datos OHLCV de Bitget"""
     try:
-        if since:
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=limit)
-        else:
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         df.set_index('timestamp', inplace=True)
@@ -178,28 +179,86 @@ def detectar_ruptura_1h(rsi_values, diagonal, umbral=0.02):
     
     return False, None
 
+def simular_trade(df_1h, idx_entrada, entry_price, techo_canal, suelo_canal):
+    """
+    Simular el resultado de un trade:
+    - SL: 1.5% debajo de entrada (o mínimo de 5 velas, el que sea más cercano)
+    - TP: 3% arriba de entrada (o techo del canal 4h proyectado)
+    - Salida por SL, TP o time exit (20 velas 1h = 20h)
+    """
+    if idx_entrada >= len(df_1h) - 1:
+        return None
+    
+    # Calcular SL y TP
+    sl_price = entry_price * (1 - CONFIG['sl_pct'])
+    tp_price = entry_price * (1 + CONFIG['tp_pct'])
+    
+    # También usar techo del canal como TP alternativo
+    tp_canal = entry_price * (techo_canal / 50)  # Aproximación
+    
+    tp_final = min(tp_price, tp_canal)
+    
+    # Buscar mínimo de las últimas 5 velas para SL más ajustado
+    min_recent = df_1h['low'].iloc[max(0, idx_entrada-5):idx_entrada].min()
+    sl_final = max(sl_price, min_recent * 0.999)
+    
+    # Simular recorrido hacia adelante
+    max_velas = 20  # Time exit después de 20 velas 1h
+    for i in range(1, min(max_velas, len(df_1h) - idx_entrada)):
+        vela = df_1h.iloc[idx_entrada + i]
+        
+        # ¿Tocó SL?
+        if vela['low'] <= sl_final:
+            return {
+                'resultado': 'SL',
+                'exit_price': sl_final,
+                'pnl_pct': -CONFIG['sl_pct'] * 100,
+                'velas_duracion': i,
+                'fecha_salida': df_1h.index[idx_entrada + i]
+            }
+        
+        # ¿Tocó TP?
+        if vela['high'] >= tp_final:
+            return {
+                'resultado': 'TP',
+                'exit_price': tp_final,
+                'pnl_pct': CONFIG['tp_pct'] * 100,
+                'velas_duracion': i,
+                'fecha_salida': df_1h.index[idx_entrada + i]
+            }
+    
+    # Time exit: cerrar al precio de cierre
+    exit_price = df_1h['close'].iloc[idx_entrada + min(max_velas, len(df_1h) - idx_entrada - 1)]
+    pnl_pct = (exit_price - entry_price) / entry_price * 100
+    
+    return {
+        'resultado': 'TIME_EXIT',
+        'exit_price': exit_price,
+        'pnl_pct': pnl_pct,
+        'velas_duracion': min(max_velas, len(df_1h) - idx_entrada - 1),
+        'fecha_salida': df_1h.index[idx_entrada + min(max_velas, len(df_1h) - idx_entrada - 1)]
+    }
+
 def backtest_completo(df_4h, df_1h):
     """
-    Backtest: revisar cada vela 4h del pasado para ver si hubo señal
+    Backtest: revisar cada vela 4h y simular trades
     """
     log("="*60)
-    log("INICIANDO BACKTEST COMPLETO")
+    log("INICIANDO BACKTEST CON SIMULACION")
     log("="*60)
     
-    señales = []
+    trades = []
     rsi_4h = df_4h['rsi'].values
-    rsi_1h = df_1h['rsi'].values
     closes_4h = df_4h['close'].values
+    rsi_1h = df_1h['rsi'].values
     closes_1h = df_1h['close'].values
     
-    # Ventana mínima para detectar canal: 50 velas 4h
     ventana_min = 50
     
     log(f"Total velas 4h: {len(df_4h)}")
     log(f"Total velas 1h: {len(df_1h)}")
-    log(f"Analizando desde vela {ventana_min} hasta {len(df_4h)-1}...")
+    log(f"Analizando...")
     
-    # Para cada vela 4h, mirar hacia atrás y ver si había setup
     for i in range(ventana_min, len(df_4h) - 1):
         # RSI 4h hasta esta vela
         rsi_4h_window = rsi_4h[:i+1]
@@ -214,8 +273,7 @@ def backtest_completo(df_4h, df_1h):
         if not rebote:
             continue
         
-        # Encontrar ventana 1h correspondiente a esta vela 4h
-        # Cada vela 4h = 4 velas 1h
+        # Encontrar ventana 1h correspondiente
         idx_1h = min((i + 1) * 4, len(rsi_1h) - 1)
         if idx_1h < 50:
             continue
@@ -232,26 +290,94 @@ def backtest_completo(df_4h, df_1h):
         if not ruptura:
             continue
         
-        # SEÑAL ENCONTRADA EN EL PASADO
+        # SEÑAL ENCONTRADA
         fecha = df_4h.index[i]
-        entry = closes_1h[idx_1h]
+        entry_price = closes_1h[idx_1h]
         
-        señales.append({
-            'fecha': fecha,
-            'idx_4h': i,
-            'idx_1h': idx_1h,
-            'entry': entry,
-            'rsi_4h': info_4h['rsi_actual'],
-            'rsi_1h': info_1h['rsi_despues'],
-            'techo_canal': info_4h['techo'],
-            'suelo_canal': info_4h['suelo'],
-        })
+        # Simular trade
+        resultado_trade = simular_trade(df_1h, idx_1h, entry_price, 
+                                        info_4h['techo'], info_4h['suelo'])
+        
+        if resultado_trade:
+            trades.append({
+                'fecha_entrada': fecha,
+                'idx_4h': i,
+                'idx_1h': idx_1h,
+                'entry': entry_price,
+                'sl': entry_price * (1 - CONFIG['sl_pct']),
+                'tp': entry_price * (1 + CONFIG['tp_pct']),
+                'rsi_4h': info_4h['rsi_actual'],
+                'rsi_1h': info_1h['rsi_despues'],
+                'techo_canal': info_4h['techo'],
+                'suelo_canal': info_4h['suelo'],
+                **resultado_trade
+            })
     
-    return señales
+    return trades
+
+def calcular_metricas(trades, balance_inicial=1000):
+    """Calcular métricas de rendimiento"""
+    if not trades:
+        return None
+    
+    n_trades = len(trades)
+    ganadores = [t for t in trades if t['pnl_pct'] > 0]
+    perdedores = [t for t in trades if t['pnl_pct'] <= 0]
+    
+    n_ganadores = len(ganadores)
+    n_perdedores = len(perdedores)
+    win_rate = n_ganadores / n_trades * 100
+    
+    # P&L total (con apalancamiento)
+    pnl_total = sum(t['pnl_pct'] for t in trades)
+    pnl_promedio = pnl_total / n_trades
+    
+    # Balance final simulado
+    balance = balance_inicial
+    max_balance = balance
+    min_balance = balance
+    max_drawdown = 0
+    
+    balances = [balance]
+    
+    for trade in trades:
+        # Riesgo por trade: 2% del balance
+        riesgo = balance * CONFIG['risk_per_trade']
+        # P&L en USD
+        pnl_usd = riesgo * (trade['pnl_pct'] / CONFIG['sl_pct'] / 100)
+        balance += pnl_usd
+        
+        balances.append(balance)
+        
+        if balance > max_balance:
+            max_balance = balance
+        
+        drawdown = (max_balance - balance) / max_balance * 100
+        if drawdown > max_drawdown:
+            max_drawdown = drawdown
+        
+        if balance < min_balance:
+            min_balance = balance
+    
+    profit_factor = sum(t['pnl_pct'] for t in ganadores) / abs(sum(t['pnl_pct'] for t in perdedores)) if perdedores else float('inf')
+    
+    return {
+        'n_trades': n_trades,
+        'n_ganadores': n_ganadores,
+        'n_perdedores': n_perdedores,
+        'win_rate': win_rate,
+        'pnl_total_pct': (balance - balance_inicial) / balance_inicial * 100,
+        'pnl_promedio': pnl_promedio,
+        'balance_inicial': balance_inicial,
+        'balance_final': balance,
+        'max_drawdown': max_drawdown,
+        'profit_factor': profit_factor,
+        'balances': balances
+    }
 
 def main():
     log("="*60)
-    log("BOT RSI CANALES - BACKTEST 3 MESES")
+    log("BOT RSI CANALES - BACKTEST 3 MESES CON RESULTADOS")
     log(f"Par: {CONFIG['symbol']}")
     log("="*60)
     
@@ -270,9 +396,7 @@ def main():
     # Descargar datos amplios (3 meses)
     log("Descargando datos históricos...")
     
-    # 4h: ~3 meses = ~540 velas
     df_4h = fetch_data(exchange, CONFIG['symbol'], '4h', limit=600)
-    # 1h: ~3 meses = ~2160 velas  
     df_1h = fetch_data(exchange, CONFIG['symbol'], '1h', limit=2200)
     
     if df_4h is None or df_1h is None:
@@ -287,41 +411,49 @@ def main():
     df_1h['rsi'] = calcular_rsi(df_1h['close'])
     
     # BACKTEST
-    señales = backtest_completo(df_4h, df_1h)
+    trades = backtest_completo(df_4h, df_1h)
     
     # RESULTADOS
     log("")
     log("="*60)
     log("RESULTADOS DEL BACKTEST")
     log("="*60)
-    log(f"Periodo analizado: {df_4h.index[0].strftime('%Y-%m-%d')} -> {df_4h.index[-1].strftime('%Y-%m-%d')}")
+    log(f"Periodo: {df_4h.index[0].strftime('%Y-%m-%d')} -> {df_4h.index[-1].strftime('%Y-%m-%d')}")
     log(f"Total velas 4h: {len(df_4h)}")
-    log(f"Total velas 1h: {len(df_1h)}")
     log(f"")
-    log(f"SEÑALES ENCONTRADAS: {len(señales)}")
+    log(f"TRADES ENCONTRADOS: {len(trades)}")
     log(f"")
     
-    if len(señales) == 0:
+    if len(trades) == 0:
         log("NO HUBO NINGUNA SEÑAL EN ESTE PERIODO")
-        log("")
-        log("Posibles causas:")
-        log("- XRP no formó canales descendentes claros en 4h")
-        log("- El mercado estuvo en tendencia lateral sin estructura")
-        log("- Los parámetros son muy estrictos")
-        log("")
         log("Recomendación: Probar con otros pares (ADA, SOL, DOGE)")
     else:
-        log("DETALLE DE SEÑALES:")
-        log("-" * 60)
-        for i, s in enumerate(señales, 1):
-            log(f"#{i} | {s['fecha'].strftime('%Y-%m-%d %H:%M')}")
-            log(f"   Entrada: ${s['entry']:.4f}")
-            log(f"   RSI 4h: {s['rsi_4h']:.1f} (suelo: {s['suelo_canal']:.1f}, techo: {s['techo_canal']:.1f})")
-            log(f"   RSI 1h: {s['rsi_1h']:.1f}")
-            log(f"")
+        # Métricas
+        metricas = calcular_metricas(trades)
         
-        log("="*60)
-        log(f"Frecuencia: 1 señal cada {len(df_4h)//len(señales)} velas 4h (~{len(df_4h)//len(señales)//6} días)")
+        log("METRICAS GLOBALES:")
+        log("-" * 60)
+        log(f"Trades totales: {metricas['n_trades']}")
+        log(f"Ganadores: {metricas['n_ganadores']} | Perdedores: {metricas['n_perdedores']}")
+        log(f"Win Rate: {metricas['win_rate']:.1f}%")
+        log(f"Profit Factor: {metricas['profit_factor']:.2f}")
+        log(f"Max Drawdown: {metricas['max_drawdown']:.2f}%")
+        log(f"")
+        log(f"Balance inicial: ${metricas['balance_inicial']:.2f}")
+        log(f"Balance final: ${metricas['balance_final']:.2f}")
+        log(f"Return total: {metricas['pnl_total_pct']:.2f}%")
+        log(f"")
+        
+        log("DETALLE DE TRADES:")
+        log("-" * 60)
+        for i, t in enumerate(trades, 1):
+            emoji = "🟢" if t['pnl_pct'] > 0 else "🔴"
+            log(f"{emoji} #{i} | {t['fecha_entrada'].strftime('%Y-%m-%d %H:%M')}")
+            log(f"   Entrada: ${t['entry']:.4f} -> Salida: ${t['exit_price']:.4f}")
+            log(f"   Resultado: {t['resultado']} | P&L: {t['pnl_pct']:+.2f}%")
+            log(f"   Duración: {t['velas_duracion']} velas 1h (~{t['velas_duracion']}h)")
+            log(f"   RSI 4h: {t['rsi_4h']:.1f} | RSI 1h: {t['rsi_1h']:.1f}")
+            log(f"")
     
     log("="*60)
     log("Backtest finalizado")
