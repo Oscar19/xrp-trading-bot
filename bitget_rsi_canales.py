@@ -3,8 +3,8 @@ BOT RSI CANALES MULTI-TIMEFRAME
 ================================
 Estrategia:
 - 4h: Detectar canal descendente en RSI, esperar rebote en suelo
-- 1h: Detectar diagonal verde (máximos decrecientes), esperar ruptura
-- Señal: SOLO cuando ambas condiciones se alinean
+- 1h: Detectar diagonal verde (maximos decrecientes), esperar ruptura
+- Senal: SOLO cuando ambas condiciones se alinean
 """
 
 import pandas as pd
@@ -13,9 +13,9 @@ import ccxt
 import requests
 import os
 from datetime import datetime
-import json
+from scipy import stats
 
-# CONFIGURACIÓN
+# CONFIGURACION
 CONFIG = {
     'symbol': os.environ.get('BITGET_SYMBOL', 'XRP/USDT'),
     'leverage': int(os.environ.get('LEVERAGE', '5')),
@@ -70,15 +70,13 @@ def calcular_rsi(prices, period=14):
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
-def detectar_canal_4h(rsi_values, ventana_pivot=3, min_puntos=3, 
+def detectar_canal_4h(rsi_values, ventana_pivot=3, min_puntos=3,
                        pendiente_max=-0.01, diff_max=0.3, r2_min=0.3):
-    """
-    Detectar canal descendente en RSI 4h
-    """
+    """Detectar canal descendente en RSI 4h"""
     rsi = np.array(rsi_values)
     n = len(rsi)
     
-    # Encontrar máximos locales (techo)
+    # Encontrar maximos locales (techo)
     techos_idx, techos_val = [], []
     for i in range(ventana_pivot, n - ventana_pivot):
         ventana = rsi[i-ventana_pivot:i+ventana_pivot+1]
@@ -86,7 +84,7 @@ def detectar_canal_4h(rsi_values, ventana_pivot=3, min_puntos=3,
             techos_idx.append(i)
             techos_val.append(rsi[i])
     
-    # Encontrar mínimos locales (suelo)
+    # Encontrar minimos locales (suelo)
     suelos_idx, suelos_val = [], []
     for i in range(ventana_pivot, n - ventana_pivot):
         ventana = rsi[i-ventana_pivot:i+ventana_pivot+1]
@@ -97,16 +95,12 @@ def detectar_canal_4h(rsi_values, ventana_pivot=3, min_puntos=3,
     if len(techos_idx) < min_puntos or len(suelos_idx) < min_puntos:
         return None, f"Pocos pivots (techos={len(techos_idx)}, suelos={len(suelos_idx)})"
     
-    # Ajustar líneas
+    # Ajustar lineas
     x_t = np.array(techos_idx[-8:])
     y_t = np.array(techos_val[-8:])
     x_s = np.array(suelos_idx[-8:])
     y_s = np.array(suelos_val[-8:])
     
-  from scipy import stats
-    m_t, b_t, r_t, p_t, se_t = stats.linregress(x_t, y_t)
-    # Usar scipy para R²
-    from scipy import stats
     m_t, b_t, r_t, p_t, se_t = stats.linregress(x_t, y_t)
     m_s, b_s, r_s, p_s, se_s = stats.linregress(x_s, y_s)
     
@@ -115,10 +109,10 @@ def detectar_canal_4h(rsi_values, ventana_pivot=3, min_puntos=3,
         return None, f"Techo no descendente ({m_t:.4f} > {pendiente_max})"
     
     if abs(m_t - m_s) > diff_max:
-        return None, f"Líneas no paralelas (diff={abs(m_t-m_s):.4f})"
+        return None, f"Lineas no paralelas (diff={abs(m_t-m_s):.4f})"
     
     if r_t**2 < r2_min:
-        return None, f"Correlación baja (R²={r_t**2:.3f})"
+        return None, f"Correlacion baja (R2={r_t**2:.3f})"
     
     return {
         'techo_m': m_t, 'techo_b': b_t,
@@ -129,7 +123,7 @@ def detectar_canal_4h(rsi_values, ventana_pivot=3, min_puntos=3,
     }, "OK"
 
 def detectar_rebote_4h(rsi_values, canal, umbral_zona=1.15):
-    """Detectar si RSI está en zona de rebote del canal"""
+    """Detectar si RSI esta en zona de rebote del canal"""
     if not canal:
         return False, None
     
@@ -148,11 +142,7 @@ def detectar_rebote_4h(rsi_values, canal, umbral_zona=1.15):
 
 def detectar_diagonal_1h(rsi_values, ventana_pivot=5, min_puntos=3,
                           pendiente_max=-0.01, r2_min=0.3):
-    """
-    Detectar diagonal verde: máximos locales decrecientes en RSI 1h
-    """
-    from scipy import stats
-    
+    """Detectar diagonal verde: maximos locales decrecientes en RSI 1h"""
     rsi = np.array(rsi_values)
     n = len(rsi)
     
@@ -165,13 +155,13 @@ def detectar_diagonal_1h(rsi_values, ventana_pivot=5, min_puntos=3,
                 maximos_val.append(rsi[i])
     
     if len(maximos_idx) < min_puntos:
-        return None, f"Pocos máximos ({len(maximos_idx)})"
+        return None, f"Pocos maximos ({len(maximos_idx)})"
     
     # Buscar subconjunto descendente
     for n_usar in range(min_puntos, min(15, len(maximos_idx)) + 1):
         x = np.array(maximos_idx[-n_usar:])
         y = np.array(maximos_val[-n_usar:])
-        m, b, r, _, _ = stats.linregress(x, y)
+        m, b, r, p, se = stats.linregress(x, y)
         
         if m <= pendiente_max and r**2 >= r2_min:
             return {
@@ -183,7 +173,7 @@ def detectar_diagonal_1h(rsi_values, ventana_pivot=5, min_puntos=3,
     # Fallback
     x = np.array(maximos_idx[-min_puntos:])
     y = np.array(maximos_val[-min_puntos:])
-    m, b, r, _, _ = stats.linregress(x, y)
+    m, b, r, p, se = stats.linregress(x, y)
     if m <= 0.05:
         return {
             'm': m, 'b': b, 'r2': r**2,
@@ -215,7 +205,7 @@ def detectar_ruptura_1h(rsi_values, diagonal, umbral=0.02):
             'diferencia': rsi_1 - val_diag_1
         }
     
-    # También si ya está arriba desde hace rato
+    # Tambien si ya esta arriba desde hace rato
     val_diag_3 = diagonal['m'] * (n-3) + diagonal['b']
     if rsi_1 > val_diag_1 and len(rsi_values) > 3 and rsi_values[-3] > val_diag_3:
         return True, {
@@ -228,9 +218,9 @@ def detectar_ruptura_1h(rsi_values, diagonal, umbral=0.02):
     return False, None
 
 def analizar():
-    """Análisis completo multi-timeframe"""
+    """Analisis completo multi-timeframe"""
     log("="*60)
-    log("INICIANDO ANÁLISIS RSI CANALES")
+    log("INICIANDO ANALISIS RSI CANALES")
     log("="*60)
     
     # Conectar a Bitget
@@ -240,23 +230,23 @@ def analizar():
             'timeout': 30000,
             'enableRateLimit': True
         })
-        log("✅ Conectado a Bitget")
+        log("Conectado a Bitget")
     except Exception as e:
-        log(f"❌ Error conectando a Bitget: {e}")
+        log(f"Error conectando a Bitget: {e}")
         return None
     
     # Descargar datos
-    log(f"📥 Descargando datos {CONFIG['symbol']}...")
+    log(f"Descargando datos {CONFIG['symbol']}...")
     
     df_4h = fetch_data(exchange, CONFIG['symbol'], '4h', limit=200)
     df_1h = fetch_data(exchange, CONFIG['symbol'], '1h', limit=400)
     
     if df_4h is None or df_1h is None:
-        log("❌ Error descargando datos")
+        log("Error descargando datos")
         return None
     
-    log(f"   4h: {len(df_4h)} velas | {df_4h.index[0]} → {df_4h.index[-1]}")
-    log(f"   1h: {len(df_1h)} velas | {df_1h.index[0]} → {df_1h.index[-1]}")
+    log(f"   4h: {len(df_4h)} velas | {df_4h.index[0]} -> {df_4h.index[-1]}")
+    log(f"   1h: {len(df_1h)} velas | {df_1h.index[0]} -> {df_1h.index[-1]}")
     
     # Calcular RSI
     df_4h['rsi'] = calcular_rsi(df_4h['close'])
@@ -265,43 +255,45 @@ def analizar():
     log(f"   RSI 4h actual: {df_4h['rsi'].iloc[-1]:.2f}")
     log(f"   RSI 1h actual: {df_1h['rsi'].iloc[-1]:.2f}")
     
-    # ANÁLISIS 4h
-    log("\n🔍 ANÁLISIS 4h:")
+    # ANALISIS 4h
+    log("")
+    log("ANALISIS 4h:")
     canal_4h, msg_4h = detectar_canal_4h(df_4h['rsi'].dropna().values)
     
     if not canal_4h:
-        log(f"   ❌ No hay canal: {msg_4h}")
-        return {'señal': False, 'razon': msg_4h}
+        log(f"   No hay canal: {msg_4h}")
+        return {'senal': False, 'razon': msg_4h}
     
-    log(f"   ✅ Canal detectado (R² techo={canal_4h['techo_r2']:.3f})")
+    log(f"   Canal detectado (R2 techo={canal_4h['techo_r2']:.3f})")
     
     rebote_4h, info_4h = detectar_rebote_4h(df_4h['rsi'].dropna().values, canal_4h)
     
     if not rebote_4h:
-        log(f"   ❌ No en zona de rebote (RSI={info_4h['rsi_actual']:.1f}, suelo={info_4h['suelo']:.1f})")
-        return {'señal': False, 'razon': '4h no en rebote', 'info_4h': info_4h}
+        log(f"   No en zona de rebote (RSI={info_4h['rsi_actual']:.1f}, suelo={info_4h['suelo']:.1f})")
+        return {'senal': False, 'razon': '4h no en rebote', 'info_4h': info_4h}
     
-    log(f"   ✅ En zona de rebote! (RSI={info_4h['rsi_actual']:.1f}, suelo={info_4h['suelo']:.1f})")
+    log(f"   En zona de rebote! (RSI={info_4h['rsi_actual']:.1f}, suelo={info_4h['suelo']:.1f})")
     
-    # ANÁLISIS 1h
-    log("\n🔍 ANÁLISIS 1h:")
+    # ANALISIS 1h
+    log("")
+    log("ANALISIS 1h:")
     diagonal_1h, msg_1h = detectar_diagonal_1h(df_1h['rsi'].dropna().values)
     
     if not diagonal_1h:
-        log(f"   ❌ No hay diagonal: {msg_1h}")
-        return {'señal': False, 'razon': msg_1h, 'info_4h': info_4h}
+        log(f"   No hay diagonal: {msg_1h}")
+        return {'senal': False, 'razon': msg_1h, 'info_4h': info_4h}
     
-    log(f"   ✅ Diagonal detectada (R²={diagonal_1h['r2']:.3f}, {diagonal_1h['n_usados']} puntos)")
+    log(f"   Diagonal detectada (R2={diagonal_1h['r2']:.3f}, {diagonal_1h['n_usados']} puntos)")
     
     ruptura_1h, info_1h = detectar_ruptura_1h(df_1h['rsi'].dropna().values, diagonal_1h)
     
     if not ruptura_1h:
-        log(f"   ❌ Sin ruptura (RSI={df_1h['rsi'].iloc[-1]:.1f})")
-        return {'señal': False, 'razon': '1h no rompe diagonal', 'info_4h': info_4h, 'diagonal_1h': diagonal_1h}
+        log(f"   Sin ruptura (RSI={df_1h['rsi'].iloc[-1]:.1f})")
+        return {'senal': False, 'razon': '1h no rompe diagonal', 'info_4h': info_4h, 'diagonal_1h': diagonal_1h}
     
-    log(f"   ✅ RUPTURA! (+{info_1h['diferencia']:.1f} puntos)")
+    log(f"   RUPTURA! (+{info_1h['diferencia']:.1f} puntos)")
     
-    # SEÑAL COMPLETA
+    # SENAL COMPLETA
     entry = df_1h['close'].iloc[-1]
     sl = df_1h['low'].iloc[-5:].min()
     ratio_tp = info_4h['techo'] / info_4h['rsi_actual']
@@ -312,8 +304,8 @@ def analizar():
     notional = risk_amount / 0.015  # SL 1.5%
     margin = notional / CONFIG['leverage']
     
-    señal = {
-        'señal': True,
+    senal = {
+        'senal': True,
         'direccion': 'largo',
         'entry': round(entry, 4),
         'sl': round(sl, 4),
@@ -324,37 +316,38 @@ def analizar():
         'timestamp': datetime.now().isoformat()
     }
     
-    log(f"\n{'='*60}")
-    log("🚀🚀🚀 SEÑAL DETECTADA 🚀🚀🚀")
-    log(f"{'='*60}")
-    log(f"   Entrada: ${señal['entry']}")
-    log(f"   SL: ${señal['sl']}")
-    log(f"   TP: ${señal['tp']}")
-    log(f"   Margen: ${señal['margin']} | {CONFIG['leverage']}x")
+    log("")
+    log("="*60)
+    log("SENAL DETECTADA")
+    log("="*60)
+    log(f"   Entrada: ${senal['entry']}")
+    log(f"   SL: ${senal['sl']}")
+    log(f"   TP: ${senal['tp']}")
+    log(f"   Margen: ${senal['margin']} | {CONFIG['leverage']}x")
     
-    return señal
+    return senal
 
 def build_message(result):
     """Construir mensaje para Telegram"""
-    if not result['señal']:
+    if not result['senal']:
         return None
     
     lines = []
-    lines.append(f"🚀 <b>SEÑAL RSI CANALES - {CONFIG['symbol']}</b>")
-    lines.append(f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC")
+    lines.append(f"SENAL RSI CANALES - {CONFIG['symbol']}")
+    lines.append(f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC")
     lines.append("")
-    lines.append(f"📊 <b>ANÁLISIS:</b>")
+    lines.append(f"ANALISIS:")
     lines.append(f"   4h: RSI en rebote de canal (RSI={result['info_4h']['rsi_actual']:.1f})")
-    lines.append(f"   1h: RSI rompió diagonal verde (+{result['info_1h']['diferencia']:.1f} pts)")
+    lines.append(f"   1h: RSI rompio diagonal verde (+{result['info_1h']['diferencia']:.1f} pts)")
     lines.append("")
-    lines.append(f"📋 <b>ORDEN LARGO:</b>")
+    lines.append(f"ORDEN LARGO:")
     lines.append(f"   Entrada: ${result['entry']}")
     lines.append(f"   SL: ${result['sl']}")
     lines.append(f"   TP: ${result['tp']}")
     lines.append(f"   Margen: ${result['margin']} | {CONFIG['leverage']}x")
     lines.append("")
-    lines.append(f"⚠️ Modo: {'DEMO' if CONFIG['demo_mode'] else 'LIVE'}")
-    lines.append(f"💡 Abre Bitget → Futuros {CONFIG['symbol']} → Comprar/Largo")
+    lines.append(f"Modo: {'DEMO' if CONFIG['demo_mode'] else 'LIVE'}")
+    lines.append(f"Abre Bitget -> Futuros {CONFIG['symbol']} -> Comprar/Largo")
     
     return "\n".join(lines)
 
@@ -367,22 +360,25 @@ def main():
     
     result = analizar()
     
-    if result and result['señal']:
+    if result and result['senal']:
         message = build_message(result)
-        log(f"\nMensaje:\n{message}")
+        log("")
+        log(f"Mensaje:")
+        log(message)
         
         if not CONFIG['demo_mode']:
             log("Enviando alerta a Telegram...")
             success = send_telegram(message)
             if success:
-                log("✅ Alerta enviada!")
+                log("Alerta enviada!")
             else:
-                log("❌ Error enviando alerta")
+                log("Error enviando alerta")
         else:
-            log("🎓 Modo DEMO: No se envía a Telegram")
+            log("Modo DEMO: No se envia a Telegram")
     else:
         razon = result['razon'] if result else 'Error'
-        log(f"\n⏳ Sin señal: {razon}")
+        log("")
+        log(f"Sin senal: {razon}")
     
     log("="*60)
     log("Bot finalizado")
