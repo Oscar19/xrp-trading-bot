@@ -103,7 +103,8 @@ def detectar_canal_4h(rsi_values, ventana_pivot=3, min_puntos=3,
     x_s = np.array(suelos_idx[-8:])
     y_s = np.array(suelos_val[-8:])
     
-    m_t, b_t, r_t, _, _ = np.polyfit(x_t, y_t, 1, full=False)
+  from scipy import stats
+    m_t, b_t, r_t, p_t, se_t = stats.linregress(x_t, y_t)
     # Usar scipy para R²
     from scipy import stats
     m_t, b_t, r_t, p_t, se_t = stats.linregress(x_t, y_t)
