@@ -1,0 +1,28 @@
+name: Backtest RSI Canales 3 meses
+
+on:
+  workflow_dispatch:
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+
+    - name: Install dependencies
+      run: |
+        pip install ccxt pandas numpy scipy
+
+    - name: Run Backtest
+      env:
+        BITGET_SYMBOL: XRP/USDT
+        MIN_R2_CANAL: "0.3"
+        MIN_R2_DIAGONAL: "0.3"
+        UMBRAL_REBOTE: "1.15"
+      run: python backtest_rsi_canales.py
