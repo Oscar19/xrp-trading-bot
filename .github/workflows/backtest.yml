@@ -22,6 +22,11 @@ jobs:
     - name: Run Backtest
       env:
         BITGET_SYMBOL: XRP/USDT
+        BALANCE: "1000"
+        LEVERAGE: "5"
+        RISK_PER_TRADE: "0.02"
+        SL_PCT: "0.015"
+        TP_PCT: "0.03"
         MIN_R2_CANAL: "0.3"
         MIN_R2_DIAGONAL: "0.3"
         UMBRAL_REBOTE: "1.15"
