@@ -1,16 +1,12 @@
 
 """
-BOT RSI CANALES - BACKTEST v10.1
+BOT RSI CANALES - BACKTEST v10.2
 ==============================
-AJUSTES PERMISIVOS para más señales en 4H
-
-Cambios vs v10:
-- R2 min bajado de 0.30 a 0.15
-- Volumen min bajado de 1.5x a 1.2x
-- Zona RSI ampliada: < 40 (long), > 60 (short)
-- Trailing stop más suelto: 0.8% en vez de 0.5%
-- Breakeven a 1.0% en vez de 0.8%
-- Cooldown reducido a 4h
+FIXES:
+1. Cooldown correcto (evita trades duplicados)
+2. Filtro de tendencia: no LONG en bajista, no SHORT en alcista
+3. Volumen mínimo 2.0x para mejor calidad
+4. Cooldown 8h (2 velas 4h)
 """
 
 import pandas as pd
@@ -28,20 +24,20 @@ CONFIG = {
     'risk_per_trade': float(os.environ.get('RISK_PER_TRADE', '0.02')),
     'sl_pct': float(os.environ.get('SL_PCT', '0.008')),
     'tp_pct': float(os.environ.get('TP_PCT', '0.015')),
-    'trailing_stop_pct': 0.008,      # <-- MÁS SUELTO (antes 0.005)
-    'breakeven_trigger': 0.010,      # <-- MÁS ALTO (antes 0.008)
+    'trailing_stop_pct': 0.008,
+    'breakeven_trigger': 0.010,
     'time_exit_max': 20,
-    'cooldown_horas': 4,             # <-- MENOS (antes 6)
+    'cooldown_horas': 8,             # <-- 8h = 2 velas 4h
 
-    'volumen_min_ratio': 1.2,        # <-- MÁS PERMISIVO (antes 1.5)
+    'volumen_min_ratio': 2.0,      # <-- MÁS EXIGENTE (antes 1.2)
     'volumen_lookback': 10,
     'rsi_period': 14,
     'pivot_ventana': 3,
     'min_puntos_diagonal': 3,
     'pendiente_max_diagonal': 0.05,
-    'r2_min_diagonal': 0.15,         # <-- MÁS PERMISIVO (antes 0.30)
-    'zona_sobreventa': 40,           # <-- MÁS PERMISIVO (antes 35)
-    'zona_sobrecompra': 60,          # <-- MÁS PERMISIVO (antes 65)
+    'r2_min_diagonal': 0.15,
+    'zona_sobreventa': 40,
+    'zona_sobrecompra': 60,
 
     'direccion': os.environ.get('DIRECCION', 'both'),
     'debug': os.environ.get('DEBUG', 'false').lower() == 'true',
@@ -239,7 +235,7 @@ def detectar_diagonal_minimos_rsi(rsi_values, ventana_pivot=3, min_puntos=3,
     return best_diagonal, "OK" if best_diagonal else "No diagonal válida"
 
 def detectar_ruptura_diagonal_long(rsi_values, diagonal, df, idx, 
-                                    umbral_ruptura=0.5, volumen_ratio_min=1.2, 
+                                    umbral_ruptura=0.5, volumen_ratio_min=2.0, 
                                     volumen_lookback=10):
     if not diagonal:
         return False, None
@@ -289,7 +285,7 @@ def detectar_ruptura_diagonal_long(rsi_values, diagonal, df, idx,
     }
 
 def detectar_ruptura_diagonal_short(rsi_values, diagonal, df, idx,
-                                     umbral_ruptura=0.5, volumen_ratio_min=1.2,
+                                     umbral_ruptura=0.5, volumen_ratio_min=2.0,
                                      volumen_lookback=10):
     if not diagonal:
         return False, None
@@ -447,7 +443,7 @@ def simular_trade(df, idx_entrada, entry_price, direccion='long'):
 
 def backtest(df_4h):
     log("="*60)
-    log(f"INICIANDO BACKTEST v10.1 - Rupturas Diagonales RSI 4H + Volumen")
+    log(f"INICIANDO BACKTEST v10.2 - Rupturas Diagonales RSI 4H + Volumen")
     log("="*60)
 
     trades = []
@@ -456,7 +452,7 @@ def backtest(df_4h):
         'ruptura_long': 0, 'ruptura_short': 0,
         'volumen_long': 0, 'volumen_short': 0,
         'zona_rsi': 0, 'cooldown': 0,
-        'direccion': 0, 'tendencia': 0
+        'direccion': 0, 'tendencia': 0  # <-- NUEVO: filtro tendencia
     }
 
     rsi = df_4h['rsi'].values
@@ -473,6 +469,7 @@ def backtest(df_4h):
     for i in range(ventana_min, len(df_4h) - 1):
         fecha = df_4h.index[i]
 
+        # FIX v10.2: Cooldown correcto usando timestamp
         if ultimo_trade_fecha is not None:
             horas_desde_ultimo = (fecha - ultimo_trade_fecha).total_seconds() / 3600
             if horas_desde_ultimo < CONFIG['cooldown_horas']:
@@ -481,6 +478,9 @@ def backtest(df_4h):
 
         rsi_window = rsi[:i + 1]
         rsi_actual = rsi[i]
+
+        # Detectar tendencia de precio
+        tendencia = detectar_tendencia_precio(df_4h, i)
 
         diagonal_max, msg_max = detectar_diagonal_maximos_rsi(
             rsi_window,
@@ -517,6 +517,10 @@ def backtest(df_4h):
             elif rsi_actual >= CONFIG['zona_sobreventa']:
                 rechazos['zona_rsi'] += 1
                 ruptura_long = False
+            # FIX v10.2: No operar LONG en tendencia bajista
+            elif tendencia == 'bajista':
+                rechazos['tendencia'] += 1
+                ruptura_long = False
             else:
                 senal_long = True
         else:
@@ -540,6 +544,10 @@ def backtest(df_4h):
                 ruptura_short = False
             elif rsi_actual <= CONFIG['zona_sobrecompra']:
                 rechazos['zona_rsi'] += 1
+                ruptura_short = False
+            # FIX v10.2: No operar SHORT en tendencia alcista
+            elif tendencia == 'alcista':
+                rechazos['tendencia'] += 1
                 ruptura_short = False
             else:
                 senal_short = True
@@ -574,11 +582,11 @@ def backtest(df_4h):
             continue
 
         entry_price = closes[i]
-        tendencia = detectar_tendencia_precio(df_4h, i)
 
         resultado_trade = simular_trade(df_4h, i, entry_price, direccion_final)
 
         if resultado_trade:
+            # FIX v10.2: Actualizar cooldown con la fecha real del trade
             ultimo_trade_fecha = fecha
             trades.append({
                 'fecha_entrada': fecha,
@@ -678,7 +686,7 @@ def calcular_metricas(trades, balance_inicial=1000):
 
 def main():
     log("="*60)
-    log("BOT RSI CANALES - BACKTEST v10.1")
+    log("BOT RSI CANALES - BACKTEST v10.2")
     log(f"Par: {CONFIG['symbol']}")
     log(f"Timeframe: {CONFIG['timeframe']}")
     log(f"SL: {CONFIG['sl_pct']*100:.1f}% | TP: {CONFIG['tp_pct']*100:.1f}%")
@@ -688,6 +696,8 @@ def main():
     log(f"Zona SHORT: RSI > {CONFIG['zona_sobrecompra']}")
     log(f"R2 mínimo diagonal: {CONFIG['r2_min_diagonal']}")
     log(f"Trailing stop: {CONFIG['trailing_stop_pct']*100:.1f}%")
+    log(f"Cooldown: {CONFIG['cooldown_horas']}h")
+    log(f"Filtro tendencia: ACTIVO (no contratendencia)")
     log("="*60)
 
     try:
@@ -720,7 +730,7 @@ def main():
 
     log("")
     log("="*60)
-    log("RESULTADOS DEL BACKTEST v10.1")
+    log("RESULTADOS DEL BACKTEST v10.2")
     log("="*60)
     log(f"Periodo: {df.index[0].strftime('%Y-%m-%d')} -> {df.index[-1].strftime('%Y-%m-%d')}")
     log(f"Total velas {CONFIG['timeframe']}: {len(df)}")
@@ -735,7 +745,7 @@ def main():
         log("1. Reducir min_puntos_diagonal (actual: 3)")
         log("2. Reducir r2_min_diagonal (actual: 0.15)")
         log("3. Aumentar ventana de datos (más histórico)")
-        log("4. Reducir volumen_min_ratio (actual: 1.2)")
+        log("4. Reducir volumen_min_ratio (actual: 2.0)")
     else:
         metricas = calcular_metricas(trades)
 
@@ -765,8 +775,9 @@ def main():
             dir_icon = "📈" if t.get('direccion') == 'long' else "📉"
             salida_icon = "⏱️" if t['resultado'] == 'TIME_EXIT' else ("🎯" if t['resultado'] == 'TP' else "🛑")
             vol_icon = "💥" if t.get('volumen_confirmado') else "📊"
+            tendencia_icon = "🟢" if t.get('tendencia') == 'alcista' else ("🔴" if t.get('tendencia') == 'bajista' else "⚪")
 
-            log(f"{emoji} #{i} {dir_icon} | {t['fecha_entrada'].strftime('%Y-%m-%d %H:%M')} {salida_icon} {vol_icon}")
+            log(f"{emoji} #{i} {dir_icon} | {t['fecha_entrada'].strftime('%Y-%m-%d %H:%M')} {salida_icon} {vol_icon} {tendencia_icon}")
             log(f"   Entrada: ${t['entry']:.4f} -> Salida: ${t['exit_price']:.4f}")
             log(f"   Resultado: {t['resultado']} ({t['tipo_salida']}) | P&L: {t['pnl_pct']:+.2f}%")
             log(f"   Duración: {t['velas_duracion']} velas 4h")
