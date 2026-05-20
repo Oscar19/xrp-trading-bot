@@ -1,7 +1,6 @@
 name: Backtest RSI v10
 
 on:
-  # Ejecutar manualmente desde GitHub
   workflow_dispatch:
     inputs:
       symbol:
@@ -9,69 +8,46 @@ on:
         required: true
         default: 'XRP/USDT'
       direccion:
-        description: 'Dirección (long/short/both)'
+        description: 'Direccion (long/short/both)'
         required: true
-        default: 'long'
-      volumen_ratio:
-        description: 'Ratio mínimo de volumen (ej: 1.5)'
+        default: 'both'
+      leverage:
+        description: 'Apalancamiento (1, 2, 3, 5, 10)'
         required: true
-        default: '1.5'
-      sl_pct:
-        description: 'Stop Loss % (ej: 0.008)'
-        required: true
-        default: '0.008'
-      tp_pct:
-        description: 'Take Profit % (ej: 0.015)'
-        required: true
-        default: '0.015'
-
-  # O ejecutar automáticamente cada día a las 00:00 UTC
-  schedule:
-    - cron: '0 0 * * *'
+        default: '5'
 
 jobs:
   backtest:
     runs-on: ubuntu-latest
-
+    
     steps:
-    - name: Checkout código
-      uses: actions/checkout@v4
-
-    - name: Setup Python
-      uses: actions/setup-python@v5
+    - uses: actions/checkout@v4
+    
+    - uses: actions/setup-python@v5
       with:
         python-version: '3.11'
-
+        
     - name: Instalar dependencias
-      run: |
-        pip install pandas numpy ccxt scipy
-
-    - name: Ejecutar backtest v10
+      run: pip install pandas numpy ccxt scipy
+      
+    - name: Ejecutar backtest
       env:
-        BITGET_SYMBOL: ${{ github.event.inputs.symbol || 'XRP/USDT' }}
-        DIRECCION: ${{ github.event.inputs.direccion || 'long' }}
-        VOLUMEN_MIN_RATIO: ${{ github.event.inputs.volumen_ratio || '1.5' }}
-        SL_PCT: ${{ github.event.inputs.sl_pct || '0.008' }}
-        TP_PCT: ${{ github.event.inputs.tp_pct || '0.015' }}
-        BALANCE: '1000'
-        LEVERAGE: '5'
-        RISK_PER_TRADE: '0.02'
+        BITGET_SYMBOL: ${{ github.event.inputs.symbol }}
+        DIRECCION: ${{ github.event.inputs.direccion }}
+        LEVERAGE: ${{ github.event.inputs.leverage }}  # <-- AÑADIDO
       run: |
         echo "=========================================="
         echo "BOT RSI v10 - Backtest 4H + Volumen"
         echo "Par: $BITGET_SYMBOL"
         echo "Dirección: $DIRECCION"
-        echo "Volumen mínimo: ${VOLUMEN_MIN_RATIO}x"
+        echo "Apalancamiento: ${LEVERAGE}x"
         echo "=========================================="
-        python bot_rsi_canales_v10.py
-
-    - name: Guardar resultados
+        python bot_rsi_canales_v10_4.py
+        
+    - name: Guardar logs
       if: always()
       uses: actions/upload-artifact@v4
       with:
         name: resultados-backtest-v10
-        path: |
-          *.txt
-          *.csv
-          *.json
-        retention-days: 30
+        path: '*.txt'
+        retention-days: 7
