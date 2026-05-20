@@ -1,17 +1,21 @@
 """
-BOT RSI CANALES - BACKTEST v3
+BOT RSI CANALES - BACKTEST v4
 ==============================
-Fixes:
-- Datos 1h ampliados a 2200+ velas (3 meses)
-- Filtros relajados o removibles
-- Debug mode para ver por qué se rechazan señales
+Cambios fundamentales basados en análisis:
+- SL más ajustado (0.8%) para reducir pérdidas
+- TP más realista (1.5%) basado en promedio de ganadores
+- Filtro: RSI 1h < 55 en entrada (evitar sobrecompra)
+- Filtro: RSI 4h > 30 (evitar catching falling knives)
+- Filtro: ancho canal > 15 (evitar canales muy anchos)
+- Filtro: RSI 1h en ruptura debe ser < 55 (no > 60)
+- Solo 1 trade por día máximo
 """
 
 import pandas as pd
 import numpy as np
 import ccxt
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from scipy import stats
 
 # CONFIGURACION
@@ -20,23 +24,27 @@ CONFIG = {
     'balance': float(os.environ.get('BALANCE', '1000')),
     'leverage': int(os.environ.get('LEVERAGE', '5')),
     'risk_per_trade': float(os.environ.get('RISK_PER_TRADE', '0.02')),
-    'sl_pct': float(os.environ.get('SL_PCT', '0.015')),
-    'tp_pct': float(os.environ.get('TP_PCT', '0.03')),
-    'min_r2_canal': float(os.environ.get('MIN_R2_CANAL', '0.05')),      # Muy relajado
-    'min_r2_diagonal': float(os.environ.get('MIN_R2_DIAGONAL', '0.10')),  # Muy relajado
-    'umbral_rebote': float(os.environ.get('UMBRAL_REBOTE', '1.0')),      # Sin margen extra
-    'trailing_stop_pct': 0.01,
-    'breakeven_trigger': 0.015,
-    'time_exit_max': 30,
-    'debug': os.environ.get('DEBUG', 'false').lower() == 'true',  # Modo debug
-    'use_filters': os.environ.get('USE_FILTERS', 'true').lower() == 'true',  # Puedes desactivar filtros
+    'sl_pct': float(os.environ.get('SL_PCT', '0.008')),      # Bajado de 1.5% a 0.8%
+    'tp_pct': float(os.environ.get('TP_PCT', '0.015')),      # Bajado de 3% a 1.5%
+    'min_r2_canal': float(os.environ.get('MIN_R2_CANAL', '0.05')),
+    'min_r2_diagonal': float(os.environ.get('MIN_R2_DIAGONAL', '0.10')),
+    'umbral_rebote': float(os.environ.get('UMBRAL_REBOTE', '1.0')),
+    'trailing_stop_pct': 0.005,      # 0.5% trailing más ajustado
+    'breakeven_trigger': 0.008,      # BE a +0.8%
+    'time_exit_max': 20,             # Reducido a 20 velas
+    'max_rsi_1h': 55,                # NUEVO: RSI 1h máximo en entrada
+    'min_rsi_4h': 30,                # NUEVO: RSI 4h mínimo en entrada
+    'min_ancho_canal': 10,           # NUEVO: ancho mínimo del canal
+    'max_ancho_canal': 30,           # NUEVO: ancho máximo del canal
+    'cooldown_horas': 24,            # NUEVO: espera 24h entre trades
+    'debug': os.environ.get('DEBUG', 'false').lower() == 'true',
+    'use_filters': os.environ.get('USE_FILTERS', 'true').lower() == 'true',
 }
 
 def log(msg):
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
 
 def fetch_data(exchange, symbol, timeframe, limit=1000):
-    """Descargar datos OHLCV de Bitget"""
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -63,10 +71,6 @@ def calcular_atr(df, period=14):
 
 def detectar_canal_4h(rsi_values, ventana_pivot=3, min_puntos=3,
                        pendiente_max=-0.005, diff_max=0.5, r2_min=0.05):
-    """
-    Detectar canal descendente en RSI 4h.
-    CORRECCION: Más permisivo para encontrar más señales
-    """
     rsi = np.array(rsi_values)
     n = len(rsi)
     
@@ -75,10 +79,10 @@ def detectar_canal_4h(rsi_values, ventana_pivot=3, min_puntos=3,
     
     for i in range(ventana_pivot, n - ventana_pivot):
         ventana = rsi[i-ventana_pivot:i+ventana_pivot+1]
-        if rsi[i] == ventana.max() and rsi[i] > 40:  # Bajado de 45 a 40
+        if rsi[i] == ventana.max() and rsi[i] > 40:
             techos_idx.append(i)
             techos_val.append(rsi[i])
-        if rsi[i] == ventana.min() and rsi[i] < 65:  # Subido de 60 a 65
+        if rsi[i] == ventana.min() and rsi[i] < 65:
             suelos_idx.append(i)
             suelos_val.append(rsi[i])
     
@@ -96,11 +100,9 @@ def detectar_canal_4h(rsi_values, ventana_pivot=3, min_puntos=3,
     m_t, b_t, r_t, p_t, se_t = stats.linregress(x_t, y_t)
     m_s, b_s, r_s, p_s, se_s = stats.linregress(x_s, y_s)
     
-    # Canal descendente: techos bajando
     if m_t > pendiente_max:
         return None, f"Techo no descendente ({m_t:.4f} > {pendiente_max})"
     
-    # Suelos pueden subir ligeramente (canal convergente)
     if m_s > 0.02:
         return None, f"Suelo subiendo demasiado ({m_s:.4f})"
     
@@ -110,12 +112,15 @@ def detectar_canal_4h(rsi_values, ventana_pivot=3, min_puntos=3,
     if r_t**2 < r2_min:
         return None, f"Correlacion baja (R2={r_t**2:.3f})"
     
+    ancho_canal = (m_t * (n-1) + b_t) - (m_s * (n-1) + b_s)
+    
     return {
         'techo_m': m_t, 'techo_b': b_t,
         'suelo_m': m_s, 'suelo_b': b_s,
         'techo_r2': r_t**2, 'suelo_r2': r_s**2,
         'techos_idx': techos_idx, 'techos_val': techos_val,
-        'suelos_idx': suelos_idx, 'suelos_val': suelos_val
+        'suelos_idx': suelos_idx, 'suelos_val': suelos_val,
+        'ancho_canal': ancho_canal
     }, "OK"
 
 def detectar_rebote_4h(rsi_values, canal, umbral_zona=1.0):
@@ -127,38 +132,36 @@ def detectar_rebote_4h(rsi_values, canal, umbral_zona=1.0):
     techo = canal['techo_m'] * x + canal['techo_b']
     rsi_actual = rsi_values[-1]
     
-    # Más permisivo: cerca del suelo O simplemente RSI < 42
-    en_zona = rsi_actual <= suelo * umbral_zona and rsi_actual < 48  # Subido de 45 a 48
-    en_zona_baja = rsi_actual < 42  # Subido de 40 a 42
+    en_zona = rsi_actual <= suelo * umbral_zona and rsi_actual < 48
+    en_zona_baja = rsi_actual < 42
     
     return en_zona or en_zona_baja, {
         'suelo': suelo, 'techo': techo,
         'rsi_actual': rsi_actual,
-        'ancho_canal': techo - suelo
+        'ancho_canal': canal.get('ancho_canal', techo - suelo)
     }
 
 def detectar_diagonal_1h(rsi_values, ventana_pivot=5, min_puntos=3,
-                          pendiente_max=0.01, r2_min=0.10):  # pendiente_max positivo = más permisivo
+                          pendiente_max=0.01, r2_min=0.10):
     rsi = np.array(rsi_values)
     n = len(rsi)
     
     maximos_idx, maximos_val = [], []
     for i in range(ventana_pivot, n - ventana_pivot):
         ventana = rsi[i-ventana_pivot:i+ventana_pivot+1]
-        if rsi[i] == ventana.max() and rsi[i] > 30:  # Bajado de 35 a 30
-            if not maximos_idx or rsi[i] <= maximos_val[-1] * 1.15:  # Más permisivo (1.15 vs 1.08)
+        if rsi[i] == ventana.max() and rsi[i] > 30:
+            if not maximos_idx or rsi[i] <= maximos_val[-1] * 1.15:
                 maximos_idx.append(i)
                 maximos_val.append(rsi[i])
     
     if len(maximos_idx) < min_puntos:
         return None, f"Pocos maximos ({len(maximos_idx)})"
     
-    for n_usar in range(min_puntos, min(20, len(maximos_idx)) + 1):  # Hasta 20 puntos
+    for n_usar in range(min_puntos, min(20, len(maximos_idx)) + 1):
         x = np.array(maximos_idx[-n_usar:])
         y = np.array(maximos_val[-n_usar:])
         m, b, r, p, se = stats.linregress(x, y)
         
-        # Aceptar líneas casi planas o ligeramente descendentes
         if m <= pendiente_max and r**2 >= r2_min:
             return {
                 'm': m, 'b': b, 'r2': r**2,
@@ -166,7 +169,6 @@ def detectar_diagonal_1h(rsi_values, ventana_pivot=5, min_puntos=3,
                 'n_usados': n_usar
             }, "OK"
     
-    # Fallback muy permisivo
     x = np.array(maximos_idx[-min_puntos:])
     y = np.array(maximos_val[-min_puntos:])
     m, b, r, p, se = stats.linregress(x, y)
@@ -179,7 +181,7 @@ def detectar_diagonal_1h(rsi_values, ventana_pivot=5, min_puntos=3,
     
     return None, f"Tendencia muy ascendente ({m:.4f})"
 
-def detectar_ruptura_1h(rsi_values, diagonal, umbral=0.0):  # Umbral 0 = más permisivo
+def detectar_ruptura_1h(rsi_values, diagonal, umbral=0.0):
     if not diagonal:
         return False, None
     
@@ -190,7 +192,6 @@ def detectar_ruptura_1h(rsi_values, diagonal, umbral=0.0):  # Umbral 0 = más pe
     rsi_2 = rsi_values[-2]
     rsi_1 = rsi_values[-1]
     
-    # Ruptura: RSI cruza por encima de la diagonal
     ruptura = rsi_2 <= val_diag_2 and rsi_1 > val_diag_1
     
     if ruptura:
@@ -200,7 +201,6 @@ def detectar_ruptura_1h(rsi_values, diagonal, umbral=0.0):  # Umbral 0 = más pe
             'diferencia': rsi_1 - val_diag_1
         }
     
-    # Ruptura previa confirmada
     val_diag_3 = diagonal['m'] * (n-3) + diagonal['b']
     if rsi_1 > val_diag_1 and len(rsi_values) > 3 and rsi_values[-3] > val_diag_3:
         return True, {
@@ -213,16 +213,13 @@ def detectar_ruptura_1h(rsi_values, diagonal, umbral=0.0):  # Umbral 0 = más pe
     return False, None
 
 def simular_trade(df_1h, idx_entrada, entry_price):
-    """
-    Simulación simplificada con trailing + breakeven
-    """
     if idx_entrada >= len(df_1h) - 1:
         return None
     
     sl_price = entry_price * (1 - CONFIG['sl_pct'])
     tp_price = entry_price * (1 + CONFIG['tp_pct'])
     
-    # SL más ajustado
+    # SL basado en mínimo reciente
     min_recent = df_1h['low'].iloc[max(0, idx_entrada-5):idx_entrada].min()
     sl_final = max(sl_price, min_recent * 0.999)
     
@@ -286,13 +283,14 @@ def simular_trade(df_1h, idx_entrada, entry_price):
 
 def backtest_completo(df_4h, df_1h):
     log("="*60)
-    log("INICIANDO BACKTEST v3")
+    log("INICIANDO BACKTEST v4")
     log("="*60)
     
     trades = []
     rechazos = {
         'canal': 0, 'rebote': 0, 'diagonal': 0, 'ruptura': 0,
-        'filtro_vol': 0, 'filtro_tendencia': 0, 'datos_1h': 0
+        'filtro_rsi_1h': 0, 'filtro_rsi_4h': 0, 'filtro_ancho': 0,
+        'filtro_cooldown': 0, 'datos_1h': 0
     }
     
     rsi_4h = df_4h['rsi'].values
@@ -300,13 +298,13 @@ def backtest_completo(df_4h, df_1h):
     rsi_1h = df_1h['rsi'].values
     closes_1h = df_1h['close'].values
     
-    # Precalcular indicadores
     df_4h['ema20'] = df_4h['close'].ewm(span=20).mean()
     df_1h['atr'] = calcular_atr(df_1h)
     df_1h['atr_avg'] = df_1h['atr'].rolling(50).mean()
     df_1h['vol_avg'] = df_1h['volume'].rolling(20).mean()
     
     ventana_min = 50
+    ultimo_trade_fecha = None
     
     log(f"Total velas 4h: {len(df_4h)}")
     log(f"Total velas 1h: {len(df_1h)}")
@@ -315,26 +313,39 @@ def backtest_completo(df_4h, df_1h):
     log(f"Analizando...")
     
     for i in range(ventana_min, len(df_4h) - 1):
+        fecha_4h = df_4h.index[i]
+        
+        # COOLDOWN: No operar si ya hubo trade en las últimas N horas
+        if ultimo_trade_fecha is not None:
+            horas_desde_ultimo = (fecha_4h - ultimo_trade_fecha).total_seconds() / 3600
+            if horas_desde_ultimo < CONFIG['cooldown_horas']:
+                rechazos['filtro_cooldown'] += 1
+                continue
+        
         rsi_4h_window = rsi_4h[:i+1]
         
-        # Detectar canal
         canal, msg = detectar_canal_4h(rsi_4h_window)
         if not canal:
             rechazos['canal'] += 1
-            if CONFIG['debug'] and i > len(df_4h) - 10:
-                log(f"  [i={i}] Canal rechazado: {msg}")
             continue
         
-        # Verificar rebote
         rebote, info_4h = detectar_rebote_4h(rsi_4h_window, canal)
         if not rebote:
             rechazos['rebote'] += 1
             continue
         
-        # Encontrar ventana 1h correspondiente
-        # CORRECCION: Mapeo temporal preciso
-        fecha_4h = df_4h.index[i]
-        # Buscar el índice 1h más cercano a esta fecha 4h
+        # NUEVO FILTRO: RSI 4h no debe estar demasiado bajo (evitar catching falling knives)
+        if CONFIG['use_filters'] and info_4h['rsi_actual'] < CONFIG['min_rsi_4h']:
+            rechazos['filtro_rsi_4h'] += 1
+            continue
+        
+        # NUEVO FILTRO: Ancho del canal debe estar en rango razonable
+        ancho = info_4h.get('ancho_canal', 0)
+        if CONFIG['use_filters'] and (ancho < CONFIG['min_ancho_canal'] or ancho > CONFIG['max_ancho_canal']):
+            rechazos['filtro_ancho'] += 1
+            continue
+        
+        # Mapeo temporal preciso
         idx_1h_candidatos = df_1h.index.get_indexer([fecha_4h], method='nearest')
         if len(idx_1h_candidatos) == 0 or idx_1h_candidatos[0] == -1:
             continue
@@ -343,51 +354,38 @@ def backtest_completo(df_4h, df_1h):
         if idx_1h < 50:
             continue
         
-        # Verificar que tenemos datos 1h suficientes
         if idx_1h >= len(rsi_1h):
             rechazos['datos_1h'] += 1
             continue
         
-        # FILTROS (opcionales)
-        if CONFIG['use_filters']:
-            # Filtro tendencia 4h
-            ema20_4h = df_4h['ema20'].iloc[i]
-            if closes_4h[i] < ema20_4h * 0.95:  # Más permisivo (0.95 vs 0.98)
-                rechazos['filtro_tendencia'] += 1
-                continue
-            
-            # Filtro volatilidad
-            atr_actual = df_1h['atr'].iloc[idx_1h]
-            atr_avg = df_1h['atr_avg'].iloc[idx_1h]
-            if pd.notna(atr_avg) and atr_actual < atr_avg * 0.3:  # Más permisivo (0.3 vs 0.5)
-                rechazos['filtro_vol'] += 1
-                continue
-        
         rsi_1h_window = rsi_1h[:idx_1h+1]
         
-        # Detectar diagonal
         diagonal, msg = detectar_diagonal_1h(rsi_1h_window)
         if not diagonal:
             rechazos['diagonal'] += 1
-            if CONFIG['debug'] and i > len(df_4h) - 10:
-                log(f"  [i={i}] Diagonal rechazada: {msg}")
             continue
         
-        # Verificar ruptura
         ruptura, info_1h = detectar_ruptura_1h(rsi_1h_window, diagonal)
         if not ruptura:
             rechazos['ruptura'] += 1
             continue
         
+        # NUEVO FILTRO CRÍTICO: RSI 1h en ruptura no debe estar sobrecomprado
+        if CONFIG['use_filters'] and info_1h['rsi_despues'] > CONFIG['max_rsi_1h']:
+            rechazos['filtro_rsi_1h'] += 1
+            if CONFIG['debug']:
+                log(f"  [i={i}] RSI 1h {info_1h['rsi_despues']:.1f} > {CONFIG['max_rsi_1h']} (rechazado)")
+            continue
+        
         # SEÑAL ENCONTRADA
-        fecha = df_4h.index[i]
         entry_price = closes_1h[idx_1h]
         
         resultado_trade = simular_trade(df_1h, idx_1h, entry_price)
         
         if resultado_trade:
+            ultimo_trade_fecha = fecha_4h
             trades.append({
-                'fecha_entrada': fecha,
+                'fecha_entrada': fecha_4h,
                 'idx_4h': i,
                 'idx_1h': idx_1h,
                 'entry': entry_price,
@@ -397,12 +395,11 @@ def backtest_completo(df_4h, df_1h):
                 'rsi_1h': info_1h['rsi_despues'],
                 'techo_canal': info_4h['techo'],
                 'suelo_canal': info_4h['suelo'],
-                'ancho_canal': info_4h.get('ancho_canal', 0),
+                'ancho_canal': ancho,
                 **resultado_trade
             })
     
-    # Log de rechazos para debug
-    if CONFIG['debug'] or len(trades) < 3:
+    if CONFIG['debug'] or len(trades) < 5:
         log(f"")
         log(f"DEBUG - Rechazos:")
         for k, v in rechazos.items():
@@ -483,8 +480,12 @@ def calcular_metricas(trades, balance_inicial=1000):
 
 def main():
     log("="*60)
-    log("BOT RSI CANALES - BACKTEST v3")
+    log("BOT RSI CANALES - BACKTEST v4")
     log(f"Par: {CONFIG['symbol']}")
+    log(f"SL: {CONFIG['sl_pct']*100:.1f}% | TP: {CONFIG['tp_pct']*100:.1f}%")
+    log(f"Max RSI 1h: {CONFIG['max_rsi_1h']} | Min RSI 4h: {CONFIG['min_rsi_4h']}")
+    log(f"Ancho canal: {CONFIG['min_ancho_canal']}-{CONFIG['max_ancho_canal']}")
+    log(f"Cooldown: {CONFIG['cooldown_horas']}h")
     log(f"Debug: {CONFIG['debug']} | Filtros: {CONFIG['use_filters']}")
     log("="*60)
     
@@ -501,8 +502,6 @@ def main():
     
     log("Descargando datos históricos...")
     
-    # CORRECCION: Pedir más datos 1h para cubrir el mismo periodo que 4h
-    # 600 velas 4h = 2400 velas 1h. Pedimos 2500 para margen.
     df_4h = fetch_data(exchange, CONFIG['symbol'], '4h', limit=600)
     df_1h = fetch_data(exchange, CONFIG['symbol'], '1h', limit=2500)
     
@@ -513,17 +512,14 @@ def main():
     log(f"4h: {len(df_4h)} velas | {df_4h.index[0]} -> {df_4h.index[-1]}")
     log(f"1h: {len(df_1h)} velas | {df_1h.index[0]} -> {df_1h.index[-1]}")
     
-    # Calcular RSI
     df_4h['rsi'] = calcular_rsi(df_4h['close'])
     df_1h['rsi'] = calcular_rsi(df_1h['close'])
     
-    # BACKTEST
     trades = backtest_completo(df_4h, df_1h)
     
-    # RESULTADOS
     log("")
     log("="*60)
-    log("RESULTADOS DEL BACKTEST v3")
+    log("RESULTADOS DEL BACKTEST v4")
     log("="*60)
     log(f"Periodo: {df_4h.index[0].strftime('%Y-%m-%d')} -> {df_4h.index[-1].strftime('%Y-%m-%d')}")
     log(f"Total velas 4h: {len(df_4h)}")
@@ -535,13 +531,10 @@ def main():
         log("NO HUBO NINGUNA SEÑAL EN ESTE PERIODO")
         log("")
         log("SUGERENCIAS:")
-        log("1. Ejecutar con DEBUG=true para ver rechazos:")
-        log("   DEBUG=true python backtest_rsi_canales.py")
-        log("2. Desactivar filtros:")
-        log("   USE_FILTERS=false python backtest_rsi_canales.py")
+        log("1. Ejecutar con DEBUG=true para ver rechazos")
+        log("2. Desactivar filtros: USE_FILTERS=false")
         log("3. Probar otros pares: ADA, SOL, DOGE")
         log("4. Aumentar periodo a 6 meses")
-        log("5. Reducir aun más min_r2_canal=0.01 min_r2_diagonal=0.05")
     else:
         metricas = calcular_metricas(trades)
         
