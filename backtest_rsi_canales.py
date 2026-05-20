@@ -19,7 +19,7 @@ CONFIG = {
     'risk_per_trade': float(os.environ.get('RISK_PER_TRADE', '0.02')),
     'sl_pct': float(os.environ.get('SL_PCT', '0.015')),
     'tp_pct': float(os.environ.get('TP_PCT', '0.03')),
-    'min_r2_canal': float(os.environ.get('MIN_R2_CANAL', '0.3')),
+    'min_r2_canal': float(os.environ.get('MIN_R2_CANAL', '0.15')),
     'min_r2_diagonal': float(os.environ.get('MIN_R2_DIAGONAL', '0.3')),
     'umbral_rebote': float(os.environ.get('UMBRAL_REBOTE', '1.15')),
 }
