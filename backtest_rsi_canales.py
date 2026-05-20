@@ -1,10 +1,11 @@
 """
-BOT RSI CANALES - BACKTEST v5
+BOT RSI CANALES - BACKTEST v6
 ==============================
-Contexto: XRP en rango lateral bajista desde feb 2026
-Cambio: Estrategia adaptada a mercado bajista
-Opción A: Solo SHORT (vender rupturas de diagonal)
-Opción B: Filtro de tendencia + solo operar en dirección correcta
+Fixes:
+- Detección de tendencia relajada (menos "lateral")
+- Forzar descarga de 2500+ velas 1h
+- Modo auto más permisivo
+- Opción de operar en lateral (range trading)
 """
 
 import pandas as pd
@@ -34,11 +35,13 @@ CONFIG = {
     'max_ancho_canal': 30,
     'cooldown_horas': 24,
     
-    # NUEVO: Dirección de la estrategia
-    # 'auto' = detecta tendencia y opera en esa dirección
-    # 'long' = solo compras (original)
-    # 'short' = solo ventas (recomendado para XRP ahora)
-    'direccion': os.environ.get('DIRECCION', 'auto'),
+    # NUEVO: Qué hacer en mercado lateral
+    # 'auto' = detecta tendencia, opera en dirección, en lateral no opera
+    # 'auto_range' = en lateral opera en ambas direcciones según rebote del canal
+    # 'short' = solo short (para XRP bajista)
+    # 'long' = solo long
+    # 'both' = opera long y short sin filtro de tendencia
+    'direccion': os.environ.get('DIRECCION', 'short'),
     
     'debug': os.environ.get('DEBUG', 'false').lower() == 'true',
     'use_filters': os.environ.get('USE_FILTERS', 'true').lower() == 'true',
@@ -74,17 +77,20 @@ def calcular_atr(df, period=14):
 
 def detectar_tendencia(df_4h, idx, periodos=20):
     """
-    Detectar tendencia del precio basada en EMAs
-    Returns: 'alcista', 'bajista', 'lateral'
+    Detección de tendencia RELAJADA:
+    - Usa pendiente de EMA20 vs EMA50
+    - Solo bajista si precio < EMA20*0.99 y EMA20 < EMA50*0.995
+    - Solo alcista si precio > EMA20*1.01 y EMA20 > EMA50*1.005
     """
     precio = df_4h['close'].iloc[idx]
     ema20 = df_4h['ema20'].iloc[idx]
-    ema50 = df_4h['ema50'].iloc[idx] if 'ema50' in df_4h.columns else ema20
+    ema50 = df_4h['ema50'].iloc[idx]
     
-    if precio > ema20 * 1.02 and ema20 > ema50:
-        return 'alcista'
-    elif precio < ema20 * 0.98 and ema20 < ema50:
+    # Relajar umbrales
+    if precio < ema20 * 0.99 and ema20 < ema50 * 0.995:
         return 'bajista'
+    elif precio > ema20 * 1.01 and ema20 > ema50 * 1.005:
+        return 'alcista'
     else:
         return 'lateral'
 
@@ -232,15 +238,10 @@ def detectar_ruptura_1h(rsi_values, diagonal, umbral=0.0):
     return False, None
 
 def simular_trade(df_1h, idx_entrada, entry_price, direccion='long'):
-    """
-    Simular trade en dirección específica
-    direccion: 'long' o 'short'
-    """
     if idx_entrada >= len(df_1h) - 1:
         return None
     
     if direccion == 'long':
-        # LONG: comprar, TP arriba, SL abajo
         sl_price = entry_price * (1 - CONFIG['sl_pct'])
         tp_price = entry_price * (1 + CONFIG['tp_pct'])
         min_recent = df_1h['low'].iloc[max(0, idx_entrada-5):idx_entrada].min()
@@ -279,7 +280,6 @@ def simular_trade(df_1h, idx_entrada, entry_price, direccion='long'):
                         'tipo_salida': 'tp_fijo', 'direccion': 'long'}
     
     else:
-        # SHORT: vender, TP abajo, SL arriba
         sl_price = entry_price * (1 + CONFIG['sl_pct'])
         tp_price = entry_price * (1 - CONFIG['tp_pct'])
         max_recent = df_1h['high'].iloc[max(0, idx_entrada-5):idx_entrada].max()
@@ -317,7 +317,6 @@ def simular_trade(df_1h, idx_entrada, entry_price, direccion='long'):
                         'velas_duracion': i, 'fecha_salida': df_1h.index[idx_entrada + i],
                         'tipo_salida': 'tp_fijo', 'direccion': 'short'}
     
-    # Time exit
     idx_salida = idx_entrada + min(CONFIG['time_exit_max'], len(df_1h) - idx_entrada - 1)
     exit_price = df_1h['close'].iloc[idx_salida]
     
@@ -338,7 +337,7 @@ def simular_trade(df_1h, idx_entrada, entry_price, direccion='long'):
 
 def backtest_completo(df_4h, df_1h):
     log("="*60)
-    log("INICIANDO BACKTEST v5")
+    log("INICIANDO BACKTEST v6")
     log("="*60)
     
     trades = []
@@ -362,7 +361,6 @@ def backtest_completo(df_4h, df_1h):
     ventana_min = 50
     ultimo_trade_fecha = None
     
-    # Estadísticas de tendencia
     tendencias = {'alcista': 0, 'bajista': 0, 'lateral': 0}
     
     log(f"Total velas 4h: {len(df_4h)}")
@@ -375,19 +373,24 @@ def backtest_completo(df_4h, df_1h):
     for i in range(ventana_min, len(df_4h) - 1):
         fecha_4h = df_4h.index[i]
         
-        # Detectar tendencia actual
+        # Detectar tendencia
         tendencia = detectar_tendencia(df_4h, i)
         tendencias[tendencia] += 1
         
         # Determinar dirección del trade
         if CONFIG['direccion'] == 'auto':
             direccion_trade = 'short' if tendencia == 'bajista' else 'long' if tendencia == 'alcista' else None
+        elif CONFIG['direccion'] == 'auto_range':
+            # En lateral: opera según posición en el canal
+            direccion_trade = 'range'  # Se decide más abajo según rebote
         elif CONFIG['direccion'] == 'short':
             direccion_trade = 'short'
+        elif CONFIG['direccion'] == 'both':
+            direccion_trade = 'both'  # Opera long y short sin filtro
         else:
             direccion_trade = 'long'
         
-        if direccion_trade is None:
+        if direccion_trade is None and CONFIG['direccion'] == 'auto':
             rechazos['filtro_tendencia'] += 1
             continue
         
@@ -447,10 +450,26 @@ def backtest_completo(df_4h, df_1h):
             rechazos['filtro_rsi_1h'] += 1
             continue
         
+        # Determinar dirección final
+        if CONFIG['direccion'] == 'both':
+            # En modo both: si RSI 1h rompe diagonal hacia arriba = LONG
+            # Si estamos cerca del techo del canal en 4h = SHORT
+            if info_4h['rsi_actual'] < info_4h['suelo'] * 1.1:
+                direccion_final = 'long'
+            else:
+                direccion_final = 'short'
+        elif CONFIG['direccion'] == 'auto_range':
+            if info_4h['rsi_actual'] < info_4h['suelo'] * 1.05:
+                direccion_final = 'long'
+            else:
+                direccion_final = 'short'
+        else:
+            direccion_final = direccion_trade
+        
         # SEÑAL ENCONTRADA
         entry_price = closes_1h[idx_1h]
         
-        resultado_trade = simular_trade(df_1h, idx_1h, entry_price, direccion_trade)
+        resultado_trade = simular_trade(df_1h, idx_1h, entry_price, direccion_final)
         
         if resultado_trade:
             ultimo_trade_fecha = fecha_4h
@@ -459,8 +478,8 @@ def backtest_completo(df_4h, df_1h):
                 'idx_4h': i,
                 'idx_1h': idx_1h,
                 'entry': entry_price,
-                'sl': entry_price * (1 - CONFIG['sl_pct']) if direccion_trade == 'long' else entry_price * (1 + CONFIG['sl_pct']),
-                'tp': entry_price * (1 + CONFIG['tp_pct']) if direccion_trade == 'long' else entry_price * (1 - CONFIG['tp_pct']),
+                'sl': entry_price * (1 - CONFIG['sl_pct']) if direccion_final == 'long' else entry_price * (1 + CONFIG['sl_pct']),
+                'tp': entry_price * (1 + CONFIG['tp_pct']) if direccion_final == 'long' else entry_price * (1 - CONFIG['tp_pct']),
                 'rsi_4h': info_4h['rsi_actual'],
                 'rsi_1h': info_1h['rsi_despues'],
                 'techo_canal': info_4h['techo'],
@@ -532,7 +551,6 @@ def calcular_metricas(trades, balance_inicial=1000):
     returns = [t['pnl_pct'] for t in trades]
     sharpe = np.mean(returns) / np.std(returns) * np.sqrt(252) if np.std(returns) > 0 else 0
     
-    # Métricas por dirección
     longs = [t for t in trades if t.get('direccion') == 'long']
     shorts = [t for t in trades if t.get('direccion') == 'short']
     
@@ -561,7 +579,7 @@ def calcular_metricas(trades, balance_inicial=1000):
 
 def main():
     log("="*60)
-    log("BOT RSI CANALES - BACKTEST v5")
+    log("BOT RSI CANALES - BACKTEST v6")
     log(f"Par: {CONFIG['symbol']}")
     log(f"SL: {CONFIG['sl_pct']*100:.1f}% | TP: {CONFIG['tp_pct']*100:.1f}%")
     log(f"Dirección: {CONFIG['direccion']}")
@@ -581,8 +599,24 @@ def main():
     
     log("Descargando datos históricos...")
     
+    # CORRECCION: Descargar en batches si es necesario para obtener más datos
     df_4h = fetch_data(exchange, CONFIG['symbol'], '4h', limit=600)
-    df_1h = fetch_data(exchange, CONFIG['symbol'], '1h', limit=2500)
+    
+    # Intentar descargar más datos 1h
+    df_1h = fetch_data(exchange, CONFIG['symbol'], '1h', limit=1000)
+    if df_1h is not None and len(df_1h) < 1500:
+        log(f"Descargados {len(df_1h)} velas 1h, intentando obtener más...")
+        # Bitget a veces limita a 1000, intentar con since
+        try:
+            since = exchange.parse8601('2026-01-01T00:00:00Z')
+            ohlcv = exchange.fetch_ohlcv(CONFIG['symbol'], '1h', since=since, limit=2500)
+            if ohlcv and len(ohlcv) > len(df_1h):
+                df_1h = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                df_1h['timestamp'] = pd.to_datetime(df_1h['timestamp'], unit='ms')
+                df_1h.set_index('timestamp', inplace=True)
+                log(f"Descargadas {len(df_1h)} velas 1h con since")
+        except Exception as e:
+            log(f"No se pudieron descargar más datos 1h: {e}")
     
     if df_4h is None or df_1h is None:
         log("Error descargando datos")
@@ -591,6 +625,10 @@ def main():
     log(f"4h: {len(df_4h)} velas | {df_4h.index[0]} -> {df_4h.index[-1]}")
     log(f"1h: {len(df_1h)} velas | {df_1h.index[0]} -> {df_1h.index[-1]}")
     
+    # Verificar solapamiento
+    overlap = df_1h.index[-1] - df_4h.index[0]
+    log(f"Solapamiento 1h vs 4h: {overlap}")
+    
     df_4h['rsi'] = calcular_rsi(df_4h['close'])
     df_1h['rsi'] = calcular_rsi(df_1h['close'])
     
@@ -598,7 +636,7 @@ def main():
     
     log("")
     log("="*60)
-    log("RESULTADOS DEL BACKTEST v5")
+    log("RESULTADOS DEL BACKTEST v6")
     log("="*60)
     log(f"Periodo: {df_4h.index[0].strftime('%Y-%m-%d')} -> {df_4h.index[-1].strftime('%Y-%m-%d')}")
     log(f"Total velas 4h: {len(df_4h)}")
@@ -612,7 +650,9 @@ def main():
         log("SUGERENCIAS:")
         log("1. Ejecutar con DEBUG=true para ver rechazos")
         log("2. Probar DIRECCION=short para XRP bajista")
-        log("3. Probar otros pares: ADA, SOL, DOGE")
+        log("3. Probar DIRECCION=both para operar en ambas direcciones")
+        log("4. Probar otros pares: ADA, SOL, DOGE")
+        log("5. Verificar que los datos 1h cubran todo el periodo 4h")
     else:
         metricas = calcular_metricas(trades)
         
