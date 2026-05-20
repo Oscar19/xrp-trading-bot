@@ -397,26 +397,14 @@ def backtest(df_1h):
     
     for i in range(ventana_min, len(df_1h) - 1):
         fecha = df_1h.index[i]
-        
-        # COOLDOWN
-        if ultimo_trade_fecha is not None:
-            horas_desde_ultimo = (fecha - ultimo_trade_fecha).total_seconds() / 3600
-            if horas_desde_ultimo < CONFIG['cooldown_horas']:
-                rechazos['cooldown'] += 1
-                continue
-        
-        rsi_window = rsi[:i+1]
-        rsi_reciente = rsi[max(0, i-20):i+1]  # Ventana corta para diagonal
-        
-        # === MODO CANAL (más restrictivo) ===
+                # === MODO CANAL (más restrictivo) ===
         if CONFIG['modo'] == 'canal':
             canal, msg = detectar_canal_rsi_permisivo(rsi_window)
             if not canal:
                 rechazos['canal'] += 1
                 continue
             
-            rebote, info = detectar_zona_rsi(rsi_window)
-            # Usar info del canal
+            # CORRECCIÓN: Usar info del canal, no detectar_zona_rsi
             info_canal = {
                 'rsi_actual': rsi[i],
                 'suelo': canal['suelo_m'] * i + canal['suelo_b'],
@@ -430,6 +418,18 @@ def backtest(df_1h):
                 rechazos['rebote'] += 1
                 continue
         
+        # === MODO ZONA (intermedio) ===
+        elif CONFIG['modo'] == 'zona':
+            en_zona, info_zona = detectar_zona_rsi(rsi_window)
+            info_canal = {
+                'rsi_actual': rsi[i],
+                'suelo': 35,
+                'techo': 65,
+                'ancho_canal': 30
+            }
+            if not en_zona:
+                rechazos['zona'] += 1
+                continue
         # === MODO ZONA (intermedio) ===
         elif CONFIG['modo'] == 'zona':
             info_zona = detectar_zona_rsi(rsi_window)
