@@ -1,16 +1,16 @@
 
 """
-BOT RSI CANALES - BACKTEST v10
+BOT RSI CANALES - BACKTEST v10.1
 ==============================
-DETECTAR RUPTURAS DE DIAGONALES DESCENDENTES EN RSI 4H
-+ Confirmación con VOLUMEN
+AJUSTES PERMISIVOS para más señales en 4H
 
-Lógica:
-- RSI hace máximos decrecientes → línea de tendencia descendente (diagonal roja)
-- Cuando RSI rompe HACIA ARRIBA la diagonal → señal LONG
-- Cuando RSI rompe HACIA ABAJO la diagonal (de mínimos ascendentes) → señal SHORT
-- Volumen debe ser > 1.5x la media de los últimos 10 periodos para confirmar
-- RSI < 35 para LONG (sobreventa), RSI > 65 para SHORT (sobrecompra)
+Cambios vs v10:
+- R2 min bajado de 0.30 a 0.15
+- Volumen min bajado de 1.5x a 1.2x
+- Zona RSI ampliada: < 40 (long), > 60 (short)
+- Trailing stop más suelto: 0.8% en vez de 0.5%
+- Breakeven a 1.0% en vez de 0.8%
+- Cooldown reducido a 4h
 """
 
 import pandas as pd
@@ -22,27 +22,26 @@ from scipy import stats
 
 CONFIG = {
     'symbol': os.environ.get('BITGET_SYMBOL', 'XRP/USDT'),
-    'timeframe': '4h',  # <-- CAMBIO CLAVE: 4h en vez de 1h
+    'timeframe': '4h',
     'balance': float(os.environ.get('BALANCE', '1000')),
     'leverage': int(os.environ.get('LEVERAGE', '5')),
     'risk_per_trade': float(os.environ.get('RISK_PER_TRADE', '0.02')),
     'sl_pct': float(os.environ.get('SL_PCT', '0.008')),
     'tp_pct': float(os.environ.get('TP_PCT', '0.015')),
-    'trailing_stop_pct': 0.005,
-    'breakeven_trigger': 0.008,
+    'trailing_stop_pct': 0.008,      # <-- MÁS SUELTO (antes 0.005)
+    'breakeven_trigger': 0.010,      # <-- MÁS ALTO (antes 0.008)
     'time_exit_max': 20,
-    'cooldown_horas': 6,
+    'cooldown_horas': 4,             # <-- MENOS (antes 6)
 
-    # NUEVOS PARÁMETROS v10
-    'volumen_min_ratio': 1.5,      # Volumen debe ser 1.5x la media
-    'volumen_lookback': 10,        # Media de volumen sobre 10 velas
+    'volumen_min_ratio': 1.2,        # <-- MÁS PERMISIVO (antes 1.5)
+    'volumen_lookback': 10,
     'rsi_period': 14,
-    'pivot_ventana': 3,            # Ventana para detectar pivots
-    'min_puntos_diagonal': 3,      # Mínimo 3 toques para validar diagonal
-    'pendiente_max_diagonal': 0.05, # Pendiente descendente máxima (negativa)
-    'r2_min_diagonal': 0.30,       # Correlación mínima para línea válida
-    'zona_sobreventa': 35,         # RSI < 35 para long
-    'zona_sobrecompra': 65,        # RSI > 65 para short
+    'pivot_ventana': 3,
+    'min_puntos_diagonal': 3,
+    'pendiente_max_diagonal': 0.05,
+    'r2_min_diagonal': 0.15,         # <-- MÁS PERMISIVO (antes 0.30)
+    'zona_sobreventa': 40,           # <-- MÁS PERMISIVO (antes 35)
+    'zona_sobrecompra': 60,          # <-- MÁS PERMISIVO (antes 65)
 
     'direccion': os.environ.get('DIRECCION', 'both'),
     'debug': os.environ.get('DEBUG', 'false').lower() == 'true',
@@ -107,36 +106,20 @@ def calcular_rsi(prices, period=14):
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
-# ============================================================
-# NUEVA FUNCIÓN v10: Detectar diagonal descendente en MÁXIMOS del RSI
-# ============================================================
 def detectar_diagonal_maximos_rsi(rsi_values, ventana_pivot=3, min_puntos=3,
-                                   pendiente_max=-0.01, r2_min=0.30):
-    """
-    Detecta línea de tendencia descendente en los MÁXIMOS del RSI.
-
-    Parámetros:
-    - ventana_pivot: velas a cada lado para confirmar un máximo local
-    - min_puntos: mínimo de máximos locales para trazar línea
-    - pendiente_max: debe ser negativa (descendente). Ej: -0.01 = baja 1 RSI cada 100 velas
-    - r2_min: correlación mínima (0.30 = 30% de varianza explicada)
-
-    Retorna: diagonal_dict o None
-    """
+                                   pendiente_max=-0.01, r2_min=0.15):
     rsi = np.array(rsi_values)
     n = len(rsi)
 
     if n < ventana_pivot * 2 + 1:
         return None, "Datos insuficientes"
 
-    # 1. Encontrar máximos locales (pivots)
     maximos_idx = []
     maximos_val = []
 
     for i in range(ventana_pivot, n - ventana_pivot):
         ventana = rsi[i - ventana_pivot:i + ventana_pivot + 1]
-        if rsi[i] == ventana.max() and rsi[i] > 30:  # Ignorar máximos muy bajos
-            # Evitar máximos muy cercanos (dentro de 5 velas del anterior)
+        if rsi[i] == ventana.max() and rsi[i] > 30:
             if not maximos_idx or (i - maximos_idx[-1]) >= 5:
                 maximos_idx.append(i)
                 maximos_val.append(rsi[i])
@@ -144,74 +127,53 @@ def detectar_diagonal_maximos_rsi(rsi_values, ventana_pivot=3, min_puntos=3,
     if len(maximos_idx) < min_puntos:
         return None, f"Pocos máximos ({len(maximos_idx)} < {min_puntos})"
 
-    # 2. Probar con diferentes cantidades de puntos (desde min_puntos hasta todos)
     best_diagonal = None
     best_score = -999
 
     for n_usar in range(min_puntos, min(20, len(maximos_idx)) + 1):
-        # Tomar los últimos n_usar máximos
         x = np.array(maximos_idx[-n_usar:])
         y = np.array(maximos_val[-n_usar:])
 
         if len(x) < 2:
             continue
 
-        # Regresión lineal
         m, b, r, p, se = stats.linregress(x, y)
 
-        # La pendiente debe ser descendente (negativa)
-        if m > pendiente_max:  # pendiente_max es negativo, ej: -0.01
+        if m > pendiente_max:
             continue
 
-        # R2 debe ser suficiente
         r2 = r ** 2
         if r2 < r2_min:
             continue
 
-        # Score: combinación de R2 y "frescura" (más puntos recientes = mejor)
         score = r2 * 100 + n_usar * 2 + (x[-1] / n) * 10
 
         if score > best_score:
             best_score = score
             best_diagonal = {
-                'm': m,
-                'b': b,
-                'r2': r2,
-                'maximos_idx': maximos_idx,
-                'maximos_val': maximos_val,
+                'm': m, 'b': b, 'r2': r2,
+                'maximos_idx': maximos_idx, 'maximos_val': maximos_val,
                 'n_usados': n_usar,
-                'ultimo_max_idx': x[-1],
-                'ultimo_max_val': y[-1],
-                'primero_max_idx': x[0],
-                'primero_max_val': y[0],
+                'ultimo_max_idx': x[-1], 'ultimo_max_val': y[-1],
+                'primero_max_idx': x[0], 'primero_max_val': y[0],
             }
 
-    if best_diagonal is None:
-        # Fallback: intentar con los últimos 2 puntos sin restricción de R2
-        if len(maximos_idx) >= 2:
-            x = np.array(maximos_idx[-2:])
-            y = np.array(maximos_val[-2:])
-            m, b, r, p, se = stats.linregress(x, y)
-            if m < 0:  # Al menos descendente
-                return {
-                    'm': m, 'b': b, 'r2': r**2,
-                    'maximos_idx': maximos_idx, 'maximos_val': maximos_val,
-                    'n_usados': 2, 'ultimo_max_idx': x[-1], 'ultimo_max_val': y[-1],
-                    'primero_max_idx': x[0], 'primero_max_val': y[0],
-                }, "OK (fallback 2 puntos)"
-        return None, f"No se encontró diagonal válida (m={m:.4f}, r2={r**2:.3f})"
+    if best_diagonal is None and len(maximos_idx) >= 2:
+        x = np.array(maximos_idx[-2:])
+        y = np.array(maximos_val[-2:])
+        m, b, r, p, se = stats.linregress(x, y)
+        if m < 0:
+            return {
+                'm': m, 'b': b, 'r2': r**2,
+                'maximos_idx': maximos_idx, 'maximos_val': maximos_val,
+                'n_usados': 2, 'ultimo_max_idx': x[-1], 'ultimo_max_val': y[-1],
+                'primero_max_idx': x[0], 'primero_max_val': y[0],
+            }, "OK (fallback 2 puntos)"
 
-    return best_diagonal, "OK"
+    return best_diagonal, "OK" if best_diagonal else f"No diagonal válida"
 
-# ============================================================
-# NUEVA FUNCIÓN v10: Detectar diagonal ascendente en MÍNIMOS del RSI (para shorts)
-# ============================================================
 def detectar_diagonal_minimos_rsi(rsi_values, ventana_pivot=3, min_puntos=3,
-                                   pendiente_min=0.01, r2_min=0.30):
-    """
-    Detecta línea de tendencia ascendente en los MÍNIMOS del RSI.
-    Para señales SHORT: ruptura hacia abajo de mínimos ascendentes.
-    """
+                                   pendiente_min=0.01, r2_min=0.15):
     rsi = np.array(rsi_values)
     n = len(rsi)
 
@@ -223,7 +185,7 @@ def detectar_diagonal_minimos_rsi(rsi_values, ventana_pivot=3, min_puntos=3,
 
     for i in range(ventana_pivot, n - ventana_pivot):
         ventana = rsi[i - ventana_pivot:i + ventana_pivot + 1]
-        if rsi[i] == ventana.min() and rsi[i] < 70:  # Ignorar mínimos muy altos
+        if rsi[i] == ventana.min() and rsi[i] < 70:
             if not minimos_idx or (i - minimos_idx[-1]) >= 5:
                 minimos_idx.append(i)
                 minimos_val.append(rsi[i])
@@ -243,7 +205,6 @@ def detectar_diagonal_minimos_rsi(rsi_values, ventana_pivot=3, min_puntos=3,
 
         m, b, r, p, se = stats.linregress(x, y)
 
-        # La pendiente debe ser ascendente (positiva)
         if m < pendiente_min:
             continue
 
@@ -277,18 +238,9 @@ def detectar_diagonal_minimos_rsi(rsi_values, ventana_pivot=3, min_puntos=3,
 
     return best_diagonal, "OK" if best_diagonal else "No diagonal válida"
 
-# ============================================================
-# NUEVA FUNCIÓN v10: Detectar ruptura de diagonal + confirmación volumen
-# ============================================================
 def detectar_ruptura_diagonal_long(rsi_values, diagonal, df, idx, 
-                                    umbral_ruptura=0.5, volumen_ratio_min=1.5, 
+                                    umbral_ruptura=0.5, volumen_ratio_min=1.2, 
                                     volumen_lookback=10):
-    """
-    Detecta cuando el RSI rompe HACIA ARRIBA una diagonal descendente.
-    + Confirma con volumen elevado.
-
-    Retorna: (ruptura_bool, info_dict)
-    """
     if not diagonal:
         return False, None
 
@@ -296,27 +248,18 @@ def detectar_ruptura_diagonal_long(rsi_values, diagonal, df, idx,
     if n < 3 or idx < 2:
         return False, None
 
-    # Valor de la diagonal en las últimas 3 velas
-    val_diag_3 = diagonal['m'] * (n - 3) + diagonal['b']
     val_diag_2 = diagonal['m'] * (n - 2) + diagonal['b']
     val_diag_1 = diagonal['m'] * (n - 1) + diagonal['b']
-    val_diag_0 = diagonal['m'] * n + diagonal['b']  # Proyección actual
 
-    rsi_3 = rsi_values[-3]
     rsi_2 = rsi_values[-2]
-    rsi_1 = rsi_values[-1]  # Vela actual (idx)
+    rsi_1 = rsi_values[-1]
 
-    # CONDICIÓN DE RUPTURA:
-    # RSI estaba bajo la diagonal (o tocándola) y ahora está claramente arriba
     condicion_base = (rsi_2 <= val_diag_2 + umbral_ruptura) and (rsi_1 > val_diag_1 + umbral_ruptura)
-
-    # Además, RSI debe estar subiendo (momentum)
     momentum = rsi_1 > rsi_2
 
     if not (condicion_base and momentum):
         return False, None
 
-    # CONFIRMACIÓN CON VOLUMEN
     if df is not None and 'volume' in df.columns and idx < len(df):
         volumen_actual = df['volume'].iloc[idx]
         volumen_media = df['volume'].iloc[max(0, idx - volumen_lookback):idx].mean()
@@ -346,11 +289,8 @@ def detectar_ruptura_diagonal_long(rsi_values, diagonal, df, idx,
     }
 
 def detectar_ruptura_diagonal_short(rsi_values, diagonal, df, idx,
-                                     umbral_ruptura=0.5, volumen_ratio_min=1.5,
+                                     umbral_ruptura=0.5, volumen_ratio_min=1.2,
                                      volumen_lookback=10):
-    """
-    Detecta cuando el RSI rompe HACIA ABAJO una diagonal ascendente (mínimos).
-    """
     if not diagonal:
         return False, None
 
@@ -364,14 +304,12 @@ def detectar_ruptura_diagonal_short(rsi_values, diagonal, df, idx,
     rsi_2 = rsi_values[-2]
     rsi_1 = rsi_values[-1]
 
-    # RSI estaba arriba de la diagonal y ahora está abajo
     condicion_base = (rsi_2 >= val_diag_2 - umbral_ruptura) and (rsi_1 < val_diag_1 - umbral_ruptura)
-    momentum = rsi_1 < rsi_2  # RSI bajando
+    momentum = rsi_1 < rsi_2
 
     if not (condicion_base and momentum):
         return False, None
 
-    # Volumen
     if df is not None and 'volume' in df.columns and idx < len(df):
         volumen_actual = df['volume'].iloc[idx]
         volumen_media = df['volume'].iloc[max(0, idx - volumen_lookback):idx].mean()
@@ -509,7 +447,7 @@ def simular_trade(df, idx_entrada, entry_price, direccion='long'):
 
 def backtest(df_4h):
     log("="*60)
-    log(f"INICIANDO BACKTEST v10 - Rupturas Diagonales RSI 4H + Volumen")
+    log(f"INICIANDO BACKTEST v10.1 - Rupturas Diagonales RSI 4H + Volumen")
     log("="*60)
 
     trades = []
@@ -524,7 +462,7 @@ def backtest(df_4h):
     rsi = df_4h['rsi'].values
     closes = df_4h['close'].values
 
-    ventana_min = 50  # Mínimo 50 velas para detectar diagonales (4h = ~8 días)
+    ventana_min = 50
     ultimo_trade_fecha = None
 
     log(f"Total velas 4h: {len(df_4h)}")
@@ -544,11 +482,6 @@ def backtest(df_4h):
         rsi_window = rsi[:i + 1]
         rsi_actual = rsi[i]
 
-        # ============================================
-        # DETECTAR DIAGONALES
-        # ============================================
-
-        # Diagonal descendente en máximos (para ruptura LONG)
         diagonal_max, msg_max = detectar_diagonal_maximos_rsi(
             rsi_window,
             ventana_pivot=CONFIG['pivot_ventana'],
@@ -557,7 +490,6 @@ def backtest(df_4h):
             r2_min=CONFIG['r2_min_diagonal']
         )
 
-        # Diagonal ascendente en mínimos (para ruptura SHORT)
         diagonal_min, msg_min = detectar_diagonal_minimos_rsi(
             rsi_window,
             ventana_pivot=CONFIG['pivot_ventana'],
@@ -566,9 +498,6 @@ def backtest(df_4h):
             r2_min=CONFIG['r2_min_diagonal']
         )
 
-        # ============================================
-        # EVALUAR RUPTURA LONG (romper diagonal descendente hacia arriba)
-        # ============================================
         senal_long = False
         info_long = None
 
@@ -586,7 +515,6 @@ def backtest(df_4h):
                 rechazos['volumen_long'] += 1
                 ruptura_long = False
             elif rsi_actual >= CONFIG['zona_sobreventa']:
-                # RSI debe estar en sobreventa para long
                 rechazos['zona_rsi'] += 1
                 ruptura_long = False
             else:
@@ -594,9 +522,6 @@ def backtest(df_4h):
         else:
             rechazos['diagonal_long'] += 1
 
-        # ============================================
-        # EVALUAR RUPTURA SHORT (romper diagonal ascendente hacia abajo)
-        # ============================================
         senal_short = False
         info_short = None
 
@@ -614,7 +539,6 @@ def backtest(df_4h):
                 rechazos['volumen_short'] += 1
                 ruptura_short = False
             elif rsi_actual <= CONFIG['zona_sobrecompra']:
-                # RSI debe estar en sobrecompra para short
                 rechazos['zona_rsi'] += 1
                 ruptura_short = False
             else:
@@ -622,14 +546,10 @@ def backtest(df_4h):
         else:
             rechazos['diagonal_short'] += 1
 
-        # ============================================
-        # DETERMINAR DIRECCIÓN FINAL
-        # ============================================
         direccion_final = None
         info_ruptura = None
 
         if senal_long and senal_short:
-            # Ambas señales: priorizar la que tenga mejor ratio de volumen
             if info_long['ratio_volumen'] >= info_short['ratio_volumen']:
                 direccion_sugerida = 'long'
                 info_ruptura = info_long
@@ -645,7 +565,6 @@ def backtest(df_4h):
         else:
             continue
 
-        # Aplicar filtro de dirección del usuario
         if CONFIG['direccion'] == 'both':
             direccion_final = direccion_sugerida
         elif CONFIG['direccion'] == direccion_sugerida:
@@ -654,7 +573,6 @@ def backtest(df_4h):
             rechazos['direccion'] += 1
             continue
 
-        # SEÑAL ENCONTRADA
         entry_price = closes[i]
         tendencia = detectar_tendencia_precio(df_4h, i)
 
@@ -730,7 +648,7 @@ def calcular_metricas(trades, balance_inicial=1000):
     expectancy = (win_rate/100 * avg_win) + ((1-win_rate/100) * avg_loss)
 
     returns = [t['pnl_pct'] for t in trades]
-    sharpe = np.mean(returns) / np.std(returns) * np.sqrt(252*6) if np.std(returns) > 0 else 0  # 6 períodos 4h por día
+    sharpe = np.mean(returns) / np.std(returns) * np.sqrt(252*6) if np.std(returns) > 0 else 0
 
     longs = [t for t in trades if t.get('direccion') == 'long']
     shorts = [t for t in trades if t.get('direccion') == 'short']
@@ -760,7 +678,7 @@ def calcular_metricas(trades, balance_inicial=1000):
 
 def main():
     log("="*60)
-    log("BOT RSI CANALES - BACKTEST v10")
+    log("BOT RSI CANALES - BACKTEST v10.1")
     log(f"Par: {CONFIG['symbol']}")
     log(f"Timeframe: {CONFIG['timeframe']}")
     log(f"SL: {CONFIG['sl_pct']*100:.1f}% | TP: {CONFIG['tp_pct']*100:.1f}%")
@@ -768,6 +686,8 @@ def main():
     log(f"Volumen mínimo: {CONFIG['volumen_min_ratio']}x media")
     log(f"Zona LONG: RSI < {CONFIG['zona_sobreventa']}")
     log(f"Zona SHORT: RSI > {CONFIG['zona_sobrecompra']}")
+    log(f"R2 mínimo diagonal: {CONFIG['r2_min_diagonal']}")
+    log(f"Trailing stop: {CONFIG['trailing_stop_pct']*100:.1f}%")
     log("="*60)
 
     try:
@@ -800,7 +720,7 @@ def main():
 
     log("")
     log("="*60)
-    log("RESULTADOS DEL BACKTEST v10")
+    log("RESULTADOS DEL BACKTEST v10.1")
     log("="*60)
     log(f"Periodo: {df.index[0].strftime('%Y-%m-%d')} -> {df.index[-1].strftime('%Y-%m-%d')}")
     log(f"Total velas {CONFIG['timeframe']}: {len(df)}")
@@ -813,9 +733,9 @@ def main():
         log("")
         log("SUGERENCIAS:")
         log("1. Reducir min_puntos_diagonal (actual: 3)")
-        log("2. Reducir r2_min_diagonal (actual: 0.30)")
+        log("2. Reducir r2_min_diagonal (actual: 0.15)")
         log("3. Aumentar ventana de datos (más histórico)")
-        log("4. Reducir volumen_min_ratio (actual: 1.5)")
+        log("4. Reducir volumen_min_ratio (actual: 1.2)")
     else:
         metricas = calcular_metricas(trades)
 
