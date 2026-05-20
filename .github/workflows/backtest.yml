@@ -1,4 +1,3 @@
-# .github/workflows/backtest.yml
 name: Backtest v8
 
 on: [push, workflow_dispatch]
