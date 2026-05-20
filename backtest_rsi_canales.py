@@ -1,11 +1,11 @@
 """
-BOT RSI CANALES - BACKTEST v8
+BOT RSI CANALES - BACKTEST v9
 ==============================
-Cambios radicales:
-- Canal más permisivo: acepta techos planos o ligeramente descendentes
-- Descarga de datos en batches para más histórico
-- Filtro de rebote más flexible
-- Opción de operar sin canal (solo diagonal + zona RSI)
+FIX CRÍTICO: La dirección del trade debe respetar la zona RSI
+- RSI < 40 → LONG (rebote desde sobreventa)
+- RSI > 60 → SHORT (rebote desde sobrecompra)
+- DIRECCION=short solo opera cuando RSI > 60
+- DIRECCION=long solo opera cuando RSI < 40
 """
 
 import pandas as pd
@@ -15,7 +15,6 @@ import os
 from datetime import datetime, timedelta
 from scipy import stats
 
-# CONFIGURACION
 CONFIG = {
     'symbol': os.environ.get('BITGET_SYMBOL', 'XRP/USDT'),
     'balance': float(os.environ.get('BALANCE', '1000')),
@@ -156,8 +155,8 @@ def detectar_zona_rsi(rsi_values):
         'sobreventa': sobreventa,
         'sobrecompra': sobrecompra,
         'rsi_actual': rsi_actual,
-        'suelo': 30,
-        'techo': 70,
+        'suelo': 35,
+        'techo': 65,
     }
 
 def detectar_diagonal_rsi(rsi_values, ventana_pivot=3, min_puntos=2,
@@ -336,13 +335,13 @@ def simular_trade(df, idx_entrada, entry_price, direccion='long'):
 
 def backtest(df_1h):
     log("="*60)
-    log(f"INICIANDO BACKTEST v8 - Modo: {CONFIG['modo']}")
+    log(f"INICIANDO BACKTEST v9 - Modo: {CONFIG['modo']}")
     log("="*60)
     
     trades = []
     rechazos = {
         'canal': 0, 'rebote': 0, 'zona': 0, 'diagonal': 0, 'ruptura': 0,
-        'cooldown': 0, 'tendencia': 0
+        'cooldown': 0, 'tendencia': 0, 'direccion': 0
     }
     
     rsi = df_1h['rsi'].values
@@ -365,9 +364,9 @@ def backtest(df_1h):
                 rechazos['cooldown'] += 1
                 continue
         
-        # CORRECCIÓN: Definir variables ANTES de los bloques if
         rsi_window = rsi[:i+1]
         rsi_reciente = rsi[max(0, i-20):i+1]
+        rsi_actual = rsi[i]
         
         # === MODO CANAL ===
         if CONFIG['modo'] == 'canal':
@@ -377,13 +376,13 @@ def backtest(df_1h):
                 continue
             
             info_canal = {
-                'rsi_actual': rsi[i],
+                'rsi_actual': rsi_actual,
                 'suelo': canal['suelo_m'] * i + canal['suelo_b'],
                 'techo': canal['techo_m'] * i + canal['techo_b'],
                 'ancho_canal': canal['ancho_canal']
             }
             
-            en_zona = rsi[i] < info_canal['suelo'] * 1.05 or rsi[i] < 40
+            en_zona = rsi_actual < info_canal['suelo'] * 1.05 or rsi_actual < 40
             if not en_zona:
                 rechazos['rebote'] += 1
                 continue
@@ -392,7 +391,7 @@ def backtest(df_1h):
         elif CONFIG['modo'] == 'zona':
             en_zona, info_zona = detectar_zona_rsi(rsi_window)
             info_canal = {
-                'rsi_actual': rsi[i],
+                'rsi_actual': rsi_actual,
                 'suelo': 35,
                 'techo': 65,
                 'ancho_canal': 30
@@ -404,7 +403,7 @@ def backtest(df_1h):
         # === MODO SOLO_DIAGONAL ===
         else:
             info_canal = {
-                'rsi_actual': rsi[i],
+                'rsi_actual': rsi_actual,
                 'suelo': 30,
                 'techo': 70,
                 'ancho_canal': 40
@@ -422,23 +421,42 @@ def backtest(df_1h):
             rechazos['ruptura'] += 1
             continue
         
-        # Determinar dirección
-        tendencia = detectar_tendencia_precio(df_1h, i)
+        # ============================================
+        # FIX CRÍTICO v9: Determinar dirección según RSI
+        # ============================================
+        # RSI < 40 → LONG (rebote desde sobreventa)
+        # RSI > 60 → SHORT (rebote desde sobrecompra)
         
+        if rsi_actual < 40:
+            direccion_sugerida = 'long'
+        elif rsi_actual > 60:
+            direccion_sugerida = 'short'
+        else:
+            # RSI entre 40-60: zona neutra, no operar o default a long
+            rechazos['direccion'] += 1
+            continue
+        
+        # Aplicar filtro de dirección del usuario
         if CONFIG['direccion'] == 'both':
-            if rsi[i] < 40:
+            direccion_final = direccion_sugerida
+        elif CONFIG['direccion'] == 'long':
+            if direccion_sugerida == 'long':
                 direccion_final = 'long'
-            elif rsi[i] > 60:
+            else:
+                rechazos['direccion'] += 1
+                continue
+        elif CONFIG['direccion'] == 'short':
+            if direccion_sugerida == 'short':
                 direccion_final = 'short'
             else:
-                direccion_final = 'long'
-        elif CONFIG['direccion'] == 'short':
-            direccion_final = 'short'
+                rechazos['direccion'] += 1
+                continue
         else:
-            direccion_final = 'long'
+            direccion_final = direccion_sugerida
         
         # SEÑAL ENCONTRADA
         entry_price = closes[i]
+        tendencia = detectar_tendencia_precio(df_1h, i)
         
         resultado_trade = simular_trade(df_1h, i, entry_price, direccion_final)
         
@@ -450,7 +468,7 @@ def backtest(df_1h):
                 'entry': entry_price,
                 'sl': entry_price * (1 - CONFIG['sl_pct']) if direccion_final == 'long' else entry_price * (1 + CONFIG['sl_pct']),
                 'tp': entry_price * (1 + CONFIG['tp_pct']) if direccion_final == 'long' else entry_price * (1 - CONFIG['tp_pct']),
-                'rsi': rsi[i],
+                'rsi': rsi_actual,
                 'techo_canal': info_canal['techo'],
                 'suelo_canal': info_canal['suelo'],
                 'ancho_canal': info_canal['ancho_canal'],
@@ -545,7 +563,7 @@ def calcular_metricas(trades, balance_inicial=1000):
 
 def main():
     log("="*60)
-    log("BOT RSI CANALES - BACKTEST v8")
+    log("BOT RSI CANALES - BACKTEST v9")
     log(f"Par: {CONFIG['symbol']}")
     log(f"SL: {CONFIG['sl_pct']*100:.1f}% | TP: {CONFIG['tp_pct']*100:.1f}%")
     log(f"Modo: {CONFIG['modo']} | Dirección: {CONFIG['direccion']}")
@@ -582,7 +600,7 @@ def main():
     
     log("")
     log("="*60)
-    log("RESULTADOS DEL BACKTEST v8")
+    log("RESULTADOS DEL BACKTEST v9")
     log("="*60)
     log(f"Periodo: {df_1h.index[0].strftime('%Y-%m-%d')} -> {df_1h.index[-1].strftime('%Y-%m-%d')}")
     log(f"Total velas 1h: {len(df_1h)}")
@@ -594,10 +612,9 @@ def main():
         log("NO HUBO NINGUNA SEÑAL EN ESTE PERIODO")
         log("")
         log("SUGERENCIAS:")
-        log("1. Probar MODO=zona")
-        log("2. Probar MODO=solo_diagonal")
-        log("3. Probar DIRECCION=both")
-        log("4. Probar otros pares: SOL, ADA, DOGE")
+        log("1. Probar MODO=solo_diagonal")
+        log("2. Probar DIRECCION=both")
+        log("3. Verificar que RSI esté entrando en zonas <35 o >65")
     else:
         metricas = calcular_metricas(trades)
         
