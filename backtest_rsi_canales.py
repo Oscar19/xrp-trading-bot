@@ -315,4 +315,269 @@ def backtest_completo(df_4h, df_1h):
     log(f"Analizando...")
     
     for i in range(ventana_min, len(df_4h) - 1):
-        rsi_4h_window =
+        rsi_4h_window = rsi_4h[:i+1]
+        
+        # Detectar canal
+        canal, msg = detectar_canal_4h(rsi_4h_window)
+        if not canal:
+            rechazos['canal'] += 1
+            if CONFIG['debug'] and i > len(df_4h) - 10:
+                log(f"  [i={i}] Canal rechazado: {msg}")
+            continue
+        
+        # Verificar rebote
+        rebote, info_4h = detectar_rebote_4h(rsi_4h_window, canal)
+        if not rebote:
+            rechazos['rebote'] += 1
+            continue
+        
+        # Encontrar ventana 1h correspondiente
+        # CORRECCION: Mapeo temporal preciso
+        fecha_4h = df_4h.index[i]
+        # Buscar el índice 1h más cercano a esta fecha 4h
+        idx_1h_candidatos = df_1h.index.get_indexer([fecha_4h], method='nearest')
+        if len(idx_1h_candidatos) == 0 or idx_1h_candidatos[0] == -1:
+            continue
+        idx_1h = idx_1h_candidatos[0]
+        
+        if idx_1h < 50:
+            continue
+        
+        # Verificar que tenemos datos 1h suficientes
+        if idx_1h >= len(rsi_1h):
+            rechazos['datos_1h'] += 1
+            continue
+        
+        # FILTROS (opcionales)
+        if CONFIG['use_filters']:
+            # Filtro tendencia 4h
+            ema20_4h = df_4h['ema20'].iloc[i]
+            if closes_4h[i] < ema20_4h * 0.95:  # Más permisivo (0.95 vs 0.98)
+                rechazos['filtro_tendencia'] += 1
+                continue
+            
+            # Filtro volatilidad
+            atr_actual = df_1h['atr'].iloc[idx_1h]
+            atr_avg = df_1h['atr_avg'].iloc[idx_1h]
+            if pd.notna(atr_avg) and atr_actual < atr_avg * 0.3:  # Más permisivo (0.3 vs 0.5)
+                rechazos['filtro_vol'] += 1
+                continue
+        
+        rsi_1h_window = rsi_1h[:idx_1h+1]
+        
+        # Detectar diagonal
+        diagonal, msg = detectar_diagonal_1h(rsi_1h_window)
+        if not diagonal:
+            rechazos['diagonal'] += 1
+            if CONFIG['debug'] and i > len(df_4h) - 10:
+                log(f"  [i={i}] Diagonal rechazada: {msg}")
+            continue
+        
+        # Verificar ruptura
+        ruptura, info_1h = detectar_ruptura_1h(rsi_1h_window, diagonal)
+        if not ruptura:
+            rechazos['ruptura'] += 1
+            continue
+        
+        # SEÑAL ENCONTRADA
+        fecha = df_4h.index[i]
+        entry_price = closes_1h[idx_1h]
+        
+        resultado_trade = simular_trade(df_1h, idx_1h, entry_price)
+        
+        if resultado_trade:
+            trades.append({
+                'fecha_entrada': fecha,
+                'idx_4h': i,
+                'idx_1h': idx_1h,
+                'entry': entry_price,
+                'sl': entry_price * (1 - CONFIG['sl_pct']),
+                'tp': entry_price * (1 + CONFIG['tp_pct']),
+                'rsi_4h': info_4h['rsi_actual'],
+                'rsi_1h': info_1h['rsi_despues'],
+                'techo_canal': info_4h['techo'],
+                'suelo_canal': info_4h['suelo'],
+                'ancho_canal': info_4h.get('ancho_canal', 0),
+                **resultado_trade
+            })
+    
+    # Log de rechazos para debug
+    if CONFIG['debug'] or len(trades) < 3:
+        log(f"")
+        log(f"DEBUG - Rechazos:")
+        for k, v in rechazos.items():
+            log(f"  {k}: {v}")
+    
+    return trades
+
+def calcular_metricas(trades, balance_inicial=1000):
+    if not trades:
+        return None
+    
+    n_trades = len(trades)
+    ganadores = [t for t in trades if t['pnl_pct'] > 0]
+    perdedores = [t for t in trades if t['pnl_pct'] <= 0]
+    
+    n_ganadores = len(ganadores)
+    n_perdedores = len(perdedores)
+    win_rate = n_ganadores / n_trades * 100
+    
+    pnl_total = sum(t['pnl_pct'] for t in trades)
+    pnl_promedio = pnl_total / n_trades
+    
+    balance = balance_inicial
+    max_balance = balance
+    min_balance = balance
+    max_drawdown = 0
+    max_drawdown_usd = 0
+    
+    balances = [balance]
+    
+    for trade in trades:
+        riesgo = balance * CONFIG['risk_per_trade']
+        pnl_usd = riesgo * (trade['pnl_pct'] / (CONFIG['sl_pct'] * 100))
+        balance += pnl_usd
+        
+        balances.append(balance)
+        
+        if balance > max_balance:
+            max_balance = balance
+        
+        drawdown = (max_balance - balance) / max_balance * 100
+        if drawdown > max_drawdown:
+            max_drawdown = drawdown
+            max_drawdown_usd = max_balance - balance
+        
+        if balance < min_balance:
+            min_balance = balance
+    
+    ganancias_totales = sum(t['pnl_pct'] for t in ganadores)
+    perdidas_totales = abs(sum(t['pnl_pct'] for t in perdedores))
+    profit_factor = ganancias_totales / perdidas_totales if perdidas_totales > 0 else float('inf')
+    
+    avg_win = np.mean([t['pnl_pct'] for t in ganadores]) if ganadores else 0
+    avg_loss = np.mean([t['pnl_pct'] for t in perdedores]) if perdedores else 0
+    expectancy = (win_rate/100 * avg_win) + ((1-win_rate/100) * avg_loss)
+    
+    returns = [t['pnl_pct'] for t in trades]
+    sharpe = np.mean(returns) / np.std(returns) * np.sqrt(252) if np.std(returns) > 0 else 0
+    
+    return {
+        'n_trades': n_trades,
+        'n_ganadores': n_ganadores,
+        'n_perdedores': n_perdedores,
+        'win_rate': win_rate,
+        'pnl_total_pct': (balance - balance_inicial) / balance_inicial * 100,
+        'pnl_promedio': pnl_promedio,
+        'balance_inicial': balance_inicial,
+        'balance_final': balance,
+        'max_drawdown': max_drawdown,
+        'max_drawdown_usd': max_drawdown_usd,
+        'profit_factor': profit_factor,
+        'expectancy': expectancy,
+        'sharpe': sharpe,
+        'avg_win': avg_win,
+        'avg_loss': avg_loss,
+        'balances': balances,
+    }
+
+def main():
+    log("="*60)
+    log("BOT RSI CANALES - BACKTEST v3")
+    log(f"Par: {CONFIG['symbol']}")
+    log(f"Debug: {CONFIG['debug']} | Filtros: {CONFIG['use_filters']}")
+    log("="*60)
+    
+    try:
+        exchange = ccxt.bitget({
+            'options': {'defaultType': 'swap'},
+            'timeout': 30000,
+            'enableRateLimit': True
+        })
+        log("Conectado a Bitget")
+    except Exception as e:
+        log(f"Error conectando: {e}")
+        return
+    
+    log("Descargando datos históricos...")
+    
+    # CORRECCION: Pedir más datos 1h para cubrir el mismo periodo que 4h
+    # 600 velas 4h = 2400 velas 1h. Pedimos 2500 para margen.
+    df_4h = fetch_data(exchange, CONFIG['symbol'], '4h', limit=600)
+    df_1h = fetch_data(exchange, CONFIG['symbol'], '1h', limit=2500)
+    
+    if df_4h is None or df_1h is None:
+        log("Error descargando datos")
+        return
+    
+    log(f"4h: {len(df_4h)} velas | {df_4h.index[0]} -> {df_4h.index[-1]}")
+    log(f"1h: {len(df_1h)} velas | {df_1h.index[0]} -> {df_1h.index[-1]}")
+    
+    # Calcular RSI
+    df_4h['rsi'] = calcular_rsi(df_4h['close'])
+    df_1h['rsi'] = calcular_rsi(df_1h['close'])
+    
+    # BACKTEST
+    trades = backtest_completo(df_4h, df_1h)
+    
+    # RESULTADOS
+    log("")
+    log("="*60)
+    log("RESULTADOS DEL BACKTEST v3")
+    log("="*60)
+    log(f"Periodo: {df_4h.index[0].strftime('%Y-%m-%d')} -> {df_4h.index[-1].strftime('%Y-%m-%d')}")
+    log(f"Total velas 4h: {len(df_4h)}")
+    log(f"")
+    log(f"TRADES ENCONTRADOS: {len(trades)}")
+    log(f"")
+    
+    if len(trades) == 0:
+        log("NO HUBO NINGUNA SEÑAL EN ESTE PERIODO")
+        log("")
+        log("SUGERENCIAS:")
+        log("1. Ejecutar con DEBUG=true para ver rechazos:")
+        log("   DEBUG=true python backtest_rsi_canales.py")
+        log("2. Desactivar filtros:")
+        log("   USE_FILTERS=false python backtest_rsi_canales.py")
+        log("3. Probar otros pares: ADA, SOL, DOGE")
+        log("4. Aumentar periodo a 6 meses")
+        log("5. Reducir aun más min_r2_canal=0.01 min_r2_diagonal=0.05")
+    else:
+        metricas = calcular_metricas(trades)
+        
+        log("METRICAS GLOBALES:")
+        log("-" * 60)
+        log(f"Trades totales: {metricas['n_trades']}")
+        log(f"Ganadores: {metricas['n_ganadores']} | Perdedores: {metricas['n_perdedores']}")
+        log(f"Win Rate: {metricas['win_rate']:.1f}%")
+        log(f"Profit Factor: {metricas['profit_factor']:.2f}")
+        log(f"Expectancy: {metricas['expectancy']:.2f}% por trade")
+        log(f"Sharpe (anualizado): {metricas['sharpe']:.2f}")
+        log(f"Max Drawdown: {metricas['max_drawdown']:.2f}% (${metricas['max_drawdown_usd']:.2f})")
+        log(f"")
+        log(f"Balance inicial: ${metricas['balance_inicial']:.2f}")
+        log(f"Balance final: ${metricas['balance_final']:.2f}")
+        log(f"Return total: {metricas['pnl_total_pct']:.2f}%")
+        log(f"Promedio ganador: {metricas['avg_win']:.2f}%")
+        log(f"Promedio perdedor: {metricas['avg_loss']:.2f}%")
+        log(f"")
+        
+        log("DETALLE DE TRADES:")
+        log("-" * 60)
+        for i, t in enumerate(trades, 1):
+            emoji = "🟢" if t['pnl_pct'] > 0 else "🔴"
+            salida_icon = "⏱️" if t['resultado'] == 'TIME_EXIT' else ("🎯" if t['resultado'] == 'TP' else "🛑")
+            log(f"{emoji} #{i} | {t['fecha_entrada'].strftime('%Y-%m-%d %H:%M')} {salida_icon}")
+            log(f"   Entrada: ${t['entry']:.4f} -> Salida: ${t['exit_price']:.4f}")
+            log(f"   Resultado: {t['resultado']} ({t['tipo_salida']}) | P&L: {t['pnl_pct']:+.2f}%")
+            log(f"   Duración: {t['velas_duracion']} velas 1h")
+            log(f"   RSI 4h: {t['rsi_4h']:.1f} | RSI 1h: {t['rsi_1h']:.1f}")
+            log(f"   Ancho canal: {t['ancho_canal']:.1f}")
+            log(f"")
+    
+    log("="*60)
+    log("Backtest finalizado")
+    log("="*60)
+
+if __name__ == "__main__":
+    main()
