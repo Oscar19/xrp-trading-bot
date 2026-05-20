@@ -1,33 +1,53 @@
-name: Backtest RSI Canales 3 meses
+name: Backtest RSI Canales
 
 on:
-  workflow_dispatch:
+  push:
+    branches: [ main ]
+  workflow_dispatch:  # Permite ejecutar manualmente desde GitHub
 
 jobs:
   backtest:
     runs-on: ubuntu-latest
-
+    
     steps:
     - uses: actions/checkout@v3
-
+    
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
         python-version: '3.10'
-
+    
     - name: Install dependencies
       run: |
-        pip install ccxt pandas numpy scipy
-
-    - name: Run Backtest
+        pip install pandas numpy ccxt scipy
+    
+    # ============================================
+    # OPCIÓN A: Variables de entorno en el workflow
+    # ============================================
+    - name: Run backtest - BOTH (recomendado)
       env:
-        BITGET_SYMBOL: XRP/USDT
-        BALANCE: "1000"
-        LEVERAGE: "5"
-        RISK_PER_TRADE: "0.02"
-        SL_PCT: "0.015"
-        TP_PCT: "0.03"
-        MIN_R2_CANAL: "0.3"
-        MIN_R2_DIAGONAL: "0.3"
-        UMBRAL_REBOTE: "1.15"
+        DIRECCION: both
+        SL_PCT: "0.008"
+        TP_PCT: "0.015"
+        BITGET_SYMBOL: "XRP/USDT"
+        DEBUG: "false"
+      run: python backtest_rsi_canales.py
+    
+    # ============================================
+    # OPCIÓN B: Ejecutar múltiples configuraciones
+    # ============================================
+    - name: Run backtest - SHORT
+      if: always()  # Se ejecuta aunque el anterior falle
+      env:
+        DIRECCION: short
+        SL_PCT: "0.008"
+        TP_PCT: "0.015"
+      run: python backtest_rsi_canales.py
+    
+    - name: Run backtest - LONG
+      if: always()
+      env:
+        DIRECCION: long
+        SL_PCT: "0.008"
+        TP_PCT: "0.015"
       run: python backtest_rsi_canales.py
