@@ -26,68 +26,15 @@ CONFIG = {
     'trailing_stop_pct': 0.005,
     'breakeven_trigger': 0.008,
     'time_exit_max': 20,
-    'cooldown_horas': 6,  # Reducido para más trades
+    'cooldown_horas': 6,
     
-    # NUEVO: Modo de operación
-    # 'canal' = requiere canal + diagonal (original)
-    # 'zona' = solo zona de sobreventa/sobrecompra + diagonal (más señales)
-    # 'solo_diagonal' = solo ruptura de diagonal (máximas señales)
     'modo': os.environ.get('MODO', 'zona'),
-    
     'direccion': os.environ.get('DIRECCION', 'both'),
     'debug': os.environ.get('DEBUG', 'false').lower() == 'true',
 }
 
 def log(msg):
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
-
-def fetch_data_batches(exchange, symbol, timeframe, total_velas=2000):
-    """
-    Descargar datos en batches para obtener más histórico
-    Bitget limita a ~1000 velas por request
-    """
-    all_data = []
-    limit = 1000
-    
-    # Primera descarga: las últimas 1000 velas
-    log(f"Descargando batch 1 ({limit} velas)...")
-    df1 = fetch_data(exchange, symbol, timeframe, limit=limit)
-    if df1 is None or len(df1) == 0:
-        return None
-    
-    all_data.append(df1)
-    
-    # Si queremos más datos, descargar desde el inicio del primero
-    if total_velas > limit and len(df1) > 0:
-        since = int(df1.index[0].timestamp() * 1000) - (limit * get_millis(timeframe))
-        if since > 0:
-            log(f"Descargando batch 2 desde {pd.to_datetime(since, unit='ms')}...")
-            try:
-                ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=limit)
-                if ohlcv and len(ohlcv) > 0:
-                    df2 = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                    df2['timestamp'] = pd.to_datetime(df2['timestamp'], unit='ms')
-                    df2.set_index('timestamp', inplace=True)
-                    # Evitar duplicados
-                    df2 = df2[df2.index < df1.index[0]]
-                    if len(df2) > 0:
-                        all_data.insert(0, df2)
-                        log(f"Batch 2: {len(df2)} velas")
-            except Exception as e:
-                log(f"No se pudo descargar batch 2: {e}")
-    
-    # Combinar
-    df_combined = pd.concat(all_data)
-    df_combined = df_combined[~df_combined.index.duplicated(keep='first')]
-    df_combined.sort_index(inplace=True)
-    
-    return df_combined
-
-def get_millis(timeframe):
-    """Convertir timeframe a milisegundos"""
-    mapping = {'1m': 60000, '5m': 300000, '15m': 900000, '30m': 1800000,
-               '1h': 3600000, '2h': 7200000, '4h': 14400000, '1d': 86400000}
-    return mapping.get(timeframe, 3600000)
 
 def fetch_data(exchange, symbol, timeframe, limit=1000):
     try:
@@ -100,6 +47,44 @@ def fetch_data(exchange, symbol, timeframe, limit=1000):
         log(f"Error descargando {timeframe}: {e}")
         return None
 
+def get_millis(timeframe):
+    mapping = {'1m': 60000, '5m': 300000, '15m': 900000, '30m': 1800000,
+               '1h': 3600000, '2h': 7200000, '4h': 14400000, '1d': 86400000}
+    return mapping.get(timeframe, 3600000)
+
+def fetch_data_batches(exchange, symbol, timeframe, total_velas=2000):
+    all_data = []
+    limit = 1000
+    
+    log(f"Descargando batch 1 ({limit} velas)...")
+    df1 = fetch_data(exchange, symbol, timeframe, limit=limit)
+    if df1 is None or len(df1) == 0:
+        return None
+    
+    all_data.append(df1)
+    
+    if total_velas > limit and len(df1) > 0:
+        since = int(df1.index[0].timestamp() * 1000) - (limit * get_millis(timeframe))
+        if since > 0:
+            log(f"Descargando batch 2 desde {pd.to_datetime(since, unit='ms')}...")
+            try:
+                ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=limit)
+                if ohlcv and len(ohlcv) > 0:
+                    df2 = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                    df2['timestamp'] = pd.to_datetime(df2['timestamp'], unit='ms')
+                    df2.set_index('timestamp', inplace=True)
+                    df2 = df2[df2.index < df1.index[0]]
+                    if len(df2) > 0:
+                        all_data.insert(0, df2)
+                        log(f"Batch 2: {len(df2)} velas")
+            except Exception as e:
+                log(f"No se pudo descargar batch 2: {e}")
+    
+    df_combined = pd.concat(all_data)
+    df_combined = df_combined[~df_combined.index.duplicated(keep='first')]
+    df_combined.sort_index(inplace=True)
+    return df_combined
+
 def calcular_rsi(prices, period=14):
     delta = prices.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
@@ -109,13 +94,6 @@ def calcular_rsi(prices, period=14):
 
 def detectar_canal_rsi_permisivo(rsi_values, ventana_pivot=3, min_puntos=3,
                                   pendiente_max=0.02, diff_max=0.8, r2_min=0.03):
-    """
-    Canal mucho más permisivo:
-    - Acepta techos planos o ligeramente descendentes (pendiente <= 0.02)
-    - Menos puntos requeridos
-    - R2 más bajo
-    - Diff máximo más amplio
-    """
     rsi = np.array(rsi_values)
     n = len(rsi)
     
@@ -145,7 +123,6 @@ def detectar_canal_rsi_permisivo(rsi_values, ventana_pivot=3, min_puntos=3,
     m_t, b_t, r_t, p_t, se_t = stats.linregress(x_t, y_t)
     m_s, b_s, r_s, p_s, se_s = stats.linregress(x_s, y_s)
     
-    # MUCHO más permisivo: techos pueden estar planos o bajando ligeramente
     if m_t > pendiente_max:
         return None, f"Techo subiendo ({m_t:.4f} > {pendiente_max})"
     
@@ -170,32 +147,21 @@ def detectar_canal_rsi_permisivo(rsi_values, ventana_pivot=3, min_puntos=3,
     }, "OK"
 
 def detectar_zona_rsi(rsi_values):
-    """
-    Alternativa simple al canal: detectar si RSI está en zona extrema
-    """
     rsi_actual = rsi_values[-1]
-    
-    # Zona de sobreventa (para long)
     sobreventa = rsi_actual < 35
-    # Zona de sobrecompra (para short)
     sobrecompra = rsi_actual > 65
+    en_zona = sobreventa or sobrecompra
     
-    return {
+    return en_zona, {
         'sobreventa': sobreventa,
         'sobrecompra': sobrecompra,
         'rsi_actual': rsi_actual,
-        'suelo': 30,  # Zona de referencia
+        'suelo': 30,
         'techo': 70,
     }
 
 def detectar_diagonal_rsi(rsi_values, ventana_pivot=3, min_puntos=2,
                            pendiente_max=0.03, r2_min=0.05):
-    """
-    Diagonal más permisiva:
-    - Menos puntos requeridos (2)
-    - Ventana de pivot más pequeña
-    - R2 más bajo
-    """
     rsi = np.array(rsi_values)
     n = len(rsi)
     
@@ -222,7 +188,6 @@ def detectar_diagonal_rsi(rsi_values, ventana_pivot=3, min_puntos=2,
                 'n_usados': n_usar
             }, "OK"
     
-    # Fallback muy permisivo
     x = np.array(maximos_idx[-min_puntos:])
     y = np.array(maximos_val[-min_puntos:])
     m, b, r, p, se = stats.linregress(x, y)
@@ -258,9 +223,6 @@ def detectar_ruptura_diagonal(rsi_values, diagonal, umbral=0.0):
     return False, None
 
 def detectar_tendencia_precio(df, idx, periodos=30):
-    """
-    Tendencia más simple y rápida
-    """
     if idx < periodos:
         return 'lateral'
     
@@ -316,7 +278,7 @@ def simular_trade(df, idx_entrada, entry_price, direccion='long'):
                         'velas_duracion': i, 'fecha_salida': df.index[idx_entrada + i],
                         'tipo_salida': 'tp_fijo', 'direccion': 'long'}
     
-    else:  # short
+    else:
         sl_price = entry_price * (1 + CONFIG['sl_pct'])
         tp_price = entry_price * (1 - CONFIG['tp_pct'])
         max_recent = df['high'].iloc[max(0, idx_entrada-3):idx_entrada].max()
@@ -354,7 +316,6 @@ def simular_trade(df, idx_entrada, entry_price, direccion='long'):
                         'velas_duracion': i, 'fecha_salida': df.index[idx_entrada + i],
                         'tipo_salida': 'tp_fijo', 'direccion': 'short'}
     
-    # Time exit
     idx_salida = idx_entrada + min(CONFIG['time_exit_max'], len(df) - idx_entrada - 1)
     exit_price = df['close'].iloc[idx_salida]
     
@@ -387,7 +348,7 @@ def backtest(df_1h):
     rsi = df_1h['rsi'].values
     closes = df_1h['close'].values
     
-    ventana_min = 30  # Reducido
+    ventana_min = 30
     ultimo_trade_fecha = None
     
     log(f"Total velas 1h: {len(df_1h)}")
@@ -397,14 +358,24 @@ def backtest(df_1h):
     
     for i in range(ventana_min, len(df_1h) - 1):
         fecha = df_1h.index[i]
-                # === MODO CANAL (más restrictivo) ===
+        
+        if ultimo_trade_fecha is not None:
+            horas_desde_ultimo = (fecha - ultimo_trade_fecha).total_seconds() / 3600
+            if horas_desde_ultimo < CONFIG['cooldown_horas']:
+                rechazos['cooldown'] += 1
+                continue
+        
+        # CORRECCIÓN: Definir variables ANTES de los bloques if
+        rsi_window = rsi[:i+1]
+        rsi_reciente = rsi[max(0, i-20):i+1]
+        
+        # === MODO CANAL ===
         if CONFIG['modo'] == 'canal':
             canal, msg = detectar_canal_rsi_permisivo(rsi_window)
             if not canal:
                 rechazos['canal'] += 1
                 continue
             
-            # CORRECCIÓN: Usar info del canal, no detectar_zona_rsi
             info_canal = {
                 'rsi_actual': rsi[i],
                 'suelo': canal['suelo_m'] * i + canal['suelo_b'],
@@ -412,13 +383,12 @@ def backtest(df_1h):
                 'ancho_canal': canal['ancho_canal']
             }
             
-            # Verificar si está en zona de rebote
             en_zona = rsi[i] < info_canal['suelo'] * 1.05 or rsi[i] < 40
             if not en_zona:
                 rechazos['rebote'] += 1
                 continue
         
-        # === MODO ZONA (intermedio) ===
+        # === MODO ZONA ===
         elif CONFIG['modo'] == 'zona':
             en_zona, info_zona = detectar_zona_rsi(rsi_window)
             info_canal = {
@@ -430,21 +400,8 @@ def backtest(df_1h):
             if not en_zona:
                 rechazos['zona'] += 1
                 continue
-        # === MODO ZONA (intermedio) ===
-        elif CONFIG['modo'] == 'zona':
-            info_zona = detectar_zona_rsi(rsi_window)
-            info_canal = {
-                'rsi_actual': rsi[i],
-                'suelo': 35,
-                'techo': 65,
-                'ancho_canal': 30
-            }
-            # No requiere canal, solo zona extrema
-            if not (info_zona['sobreventa'] or info_zona['sobrecompra']):
-                rechazos['zona'] += 1
-                continue
         
-        # === MODO SOLO_DIAGONAL (más permisivo) ===
+        # === MODO SOLO_DIAGONAL ===
         else:
             info_canal = {
                 'rsi_actual': rsi[i],
@@ -453,7 +410,7 @@ def backtest(df_1h):
                 'ancho_canal': 40
             }
         
-        # Detectar diagonal (siempre requerida)
+        # Detectar diagonal
         diagonal, msg = detectar_diagonal_rsi(rsi_reciente)
         if not diagonal:
             rechazos['diagonal'] += 1
@@ -469,13 +426,12 @@ def backtest(df_1h):
         tendencia = detectar_tendencia_precio(df_1h, i)
         
         if CONFIG['direccion'] == 'both':
-            # RSI bajo = LONG, RSI alto = SHORT
             if rsi[i] < 40:
                 direccion_final = 'long'
             elif rsi[i] > 60:
                 direccion_final = 'short'
             else:
-                direccion_final = 'long'  # Default
+                direccion_final = 'long'
         elif CONFIG['direccion'] == 'short':
             direccion_final = 'short'
         else:
@@ -609,11 +565,9 @@ def main():
     
     log("Descargando datos 1h...")
     
-    # Intentar descargar más datos con batches
     df_1h = fetch_data_batches(exchange, CONFIG['symbol'], '1h', total_velas=2000)
     
     if df_1h is None or len(df_1h) == 0:
-        # Fallback a descarga simple
         df_1h = fetch_data(exchange, CONFIG['symbol'], '1h', limit=1000)
     
     if df_1h is None:
@@ -622,13 +576,10 @@ def main():
     
     log(f"1h: {len(df_1h)} velas | {df_1h.index[0]} -> {df_1h.index[-1]}")
     
-    # Calcular RSI
     df_1h['rsi'] = calcular_rsi(df_1h['close'])
     
-    # BACKTEST
     trades = backtest(df_1h)
     
-    # RESULTADOS
     log("")
     log("="*60)
     log("RESULTADOS DEL BACKTEST v8")
@@ -643,8 +594,8 @@ def main():
         log("NO HUBO NINGUNA SEÑAL EN ESTE PERIODO")
         log("")
         log("SUGERENCIAS:")
-        log("1. Probar MODO=zona (más señales)")
-        log("2. Probar MODO=solo_diagonal (máximas señales)")
+        log("1. Probar MODO=zona")
+        log("2. Probar MODO=solo_diagonal")
         log("3. Probar DIRECCION=both")
         log("4. Probar otros pares: SOL, ADA, DOGE")
     else:
