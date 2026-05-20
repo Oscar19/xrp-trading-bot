@@ -12,7 +12,7 @@ on:
         required: true
         default: 'both'
       leverage:
-        description: 'Apalancamiento'
+        description: 'Apalancamiento (1, 2, 3, 5, 10)'
         required: true
         default: '5'
 
@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-    - uses: actions/checkout@v4  # <-- Esto descarga tu repo
+    - uses: actions/checkout@v4
     
     - uses: actions/setup-python@v5
       with:
@@ -30,16 +30,11 @@ jobs:
     - name: Instalar dependencias
       run: pip install pandas numpy ccxt scipy
       
-    - name: Verificar archivos
-      run: |
-        echo "Archivos en el repo:"
-        ls -la *.py || echo "NO HAY ARCHIVOS .py"
-        
     - name: Ejecutar backtest
       env:
         BITGET_SYMBOL: ${{ github.event.inputs.symbol }}
         DIRECCION: ${{ github.event.inputs.direccion }}
-        LEVERAGE: ${{ github.event.inputs.leverage }}
+        LEVERAGE: ${{ github.event.inputs.leverage }}  # <-- AÑADIDO
       run: |
         echo "=========================================="
         echo "BOT RSI v10 - Backtest 4H + Volumen"
