@@ -1,11 +1,13 @@
 
 """
-BOT RSI CANALES - BACKTEST v10.3
+BOT RSI CANALES - BACKTEST v10.4
 ==============================
-- Apalancamiento REAL (5x) en cálculos de P&L
-- Par: SOL/USDT por defecto
-- Timeframe: 4h
-- Rupturas de diagonales RSI + Volumen
+OPTIMIZADO para activos volátiles (SOL, ETH, BTC)
+- Diagonales más permisivas (R2 0.10, 2 puntos mínimos)
+- Volumen 1.2x (más señales)
+- Zona RSI ampliada: < 45 / > 55
+- Sin filtro de tendencia (testear primero)
+- Apalancamiento 5x
 """
 
 import pandas as pd
@@ -19,7 +21,7 @@ CONFIG = {
     'symbol': os.environ.get('BITGET_SYMBOL', 'SOL/USDT'),
     'timeframe': '4h',
     'balance': float(os.environ.get('BALANCE', '1000')),
-    'leverage': int(os.environ.get('LEVERAGE', '5')),  # <-- AHORA SÍ SE USA
+    'leverage': int(os.environ.get('LEVERAGE', '5')),
     'risk_per_trade': float(os.environ.get('RISK_PER_TRADE', '0.02')),
     'sl_pct': float(os.environ.get('SL_PCT', '0.008')),
     'tp_pct': float(os.environ.get('TP_PCT', '0.015')),
@@ -28,16 +30,17 @@ CONFIG = {
     'time_exit_max': 20,
     'cooldown_horas': 8,
 
-    'volumen_min_ratio': 1.5,      # <-- BAJADO a 1.5x para más señales
+    'volumen_min_ratio': 1.2,      # <-- BAJADO a 1.2x
     'volumen_lookback': 10,
     'rsi_period': 14,
-    'pivot_ventana': 3,
-    'min_puntos_diagonal': 3,
-    'pendiente_max_diagonal': 0.05,
-    'r2_min_diagonal': 0.15,
-    'zona_sobreventa': 40,
-    'zona_sobrecompra': 60,
+    'pivot_ventana': 2,            # <-- MÁS PERMISIVO (antes 3)
+    'min_puntos_diagonal': 2,      # <-- MÁS PERMISIVO (antes 3)
+    'pendiente_max_diagonal': 0.10, # <-- MÁS PERMISIVO (antes 0.05)
+    'r2_min_diagonal': 0.10,       # <-- BAJADO a 0.10
+    'zona_sobreventa': 45,         # <-- AMPLIADO a < 45
+    'zona_sobrecompra': 55,        # <-- AMPLIADO a > 55
 
+    'usar_filtro_tendencia': os.environ.get('FILTRO_TENDENCIA', 'false').lower() == 'true',
     'direccion': os.environ.get('DIRECCION', 'both'),
     'debug': os.environ.get('DEBUG', 'false').lower() == 'true',
 }
@@ -101,8 +104,8 @@ def calcular_rsi(prices, period=14):
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
-def detectar_diagonal_maximos_rsi(rsi_values, ventana_pivot=3, min_puntos=3,
-                                   pendiente_max=-0.01, r2_min=0.15):
+def detectar_diagonal_maximos_rsi(rsi_values, ventana_pivot=2, min_puntos=2,
+                                   pendiente_max=-0.01, r2_min=0.10):
     rsi = np.array(rsi_values)
     n = len(rsi)
 
@@ -114,8 +117,8 @@ def detectar_diagonal_maximos_rsi(rsi_values, ventana_pivot=3, min_puntos=3,
 
     for i in range(ventana_pivot, n - ventana_pivot):
         ventana = rsi[i - ventana_pivot:i + ventana_pivot + 1]
-        if rsi[i] == ventana.max() and rsi[i] > 30:
-            if not maximos_idx or (i - maximos_idx[-1]) >= 5:
+        if rsi[i] == ventana.max() and rsi[i] > 25:  # <-- Más permisivo (antes 30)
+            if not maximos_idx or (i - maximos_idx[-1]) >= 3:  # <-- Más cerca (antes 5)
                 maximos_idx.append(i)
                 maximos_val.append(rsi[i])
 
@@ -125,7 +128,7 @@ def detectar_diagonal_maximos_rsi(rsi_values, ventana_pivot=3, min_puntos=3,
     best_diagonal = None
     best_score = -999
 
-    for n_usar in range(min_puntos, min(20, len(maximos_idx)) + 1):
+    for n_usar in range(min_puntos, min(15, len(maximos_idx)) + 1):
         x = np.array(maximos_idx[-n_usar:])
         y = np.array(maximos_val[-n_usar:])
 
@@ -167,8 +170,8 @@ def detectar_diagonal_maximos_rsi(rsi_values, ventana_pivot=3, min_puntos=3,
 
     return best_diagonal, "OK" if best_diagonal else f"No diagonal válida"
 
-def detectar_diagonal_minimos_rsi(rsi_values, ventana_pivot=3, min_puntos=3,
-                                   pendiente_min=0.01, r2_min=0.15):
+def detectar_diagonal_minimos_rsi(rsi_values, ventana_pivot=2, min_puntos=2,
+                                   pendiente_min=0.01, r2_min=0.10):
     rsi = np.array(rsi_values)
     n = len(rsi)
 
@@ -180,8 +183,8 @@ def detectar_diagonal_minimos_rsi(rsi_values, ventana_pivot=3, min_puntos=3,
 
     for i in range(ventana_pivot, n - ventana_pivot):
         ventana = rsi[i - ventana_pivot:i + ventana_pivot + 1]
-        if rsi[i] == ventana.min() and rsi[i] < 70:
-            if not minimos_idx or (i - minimos_idx[-1]) >= 5:
+        if rsi[i] == ventana.min() and rsi[i] < 75:  # <-- Más permisivo (antes 70)
+            if not minimos_idx or (i - minimos_idx[-1]) >= 3:
                 minimos_idx.append(i)
                 minimos_val.append(rsi[i])
 
@@ -191,7 +194,7 @@ def detectar_diagonal_minimos_rsi(rsi_values, ventana_pivot=3, min_puntos=3,
     best_diagonal = None
     best_score = -999
 
-    for n_usar in range(min_puntos, min(20, len(minimos_idx)) + 1):
+    for n_usar in range(min_puntos, min(15, len(minimos_idx)) + 1):
         x = np.array(minimos_idx[-n_usar:])
         y = np.array(minimos_val[-n_usar:])
 
@@ -234,7 +237,7 @@ def detectar_diagonal_minimos_rsi(rsi_values, ventana_pivot=3, min_puntos=3,
     return best_diagonal, "OK" if best_diagonal else "No diagonal válida"
 
 def detectar_ruptura_diagonal_long(rsi_values, diagonal, df, idx, 
-                                    umbral_ruptura=0.5, volumen_ratio_min=1.5, 
+                                    umbral_ruptura=0.5, volumen_ratio_min=1.2, 
                                     volumen_lookback=10):
     if not diagonal:
         return False, None
@@ -284,7 +287,7 @@ def detectar_ruptura_diagonal_long(rsi_values, diagonal, df, idx,
     }
 
 def detectar_ruptura_diagonal_short(rsi_values, diagonal, df, idx,
-                                     umbral_ruptura=0.5, volumen_ratio_min=1.5,
+                                     umbral_ruptura=0.5, volumen_ratio_min=1.2,
                                      volumen_lookback=10):
     if not diagonal:
         return False, None
@@ -346,7 +349,7 @@ def simular_trade(df, idx_entrada, entry_price, direccion='long'):
     if idx_entrada >= len(df) - 1:
         return None
 
-    leverage = CONFIG['leverage']  # <-- AHORA SE USA EL APALANCAMIENTO
+    leverage = CONFIG['leverage']
 
     if direccion == 'long':
         sl_price = entry_price * (1 - CONFIG['sl_pct'])
@@ -376,9 +379,9 @@ def simular_trade(df, idx_entrada, entry_price, direccion='long'):
 
             if vela['low'] <= sl_trailing:
                 pnl_pct_raw = (sl_trailing - entry_price) / entry_price * 100
-                pnl_pct = pnl_pct_raw * leverage  # <-- APLICAR APALANCAMIENTO
+                pnl_pct = pnl_pct_raw * leverage
                 return {'resultado': 'SL', 'exit_price': sl_trailing, 'pnl_pct': pnl_pct,
-                        'pnl_pct_raw': pnl_pct_raw,  # <-- Guardar P&L sin apalancamiento
+                        'pnl_pct_raw': pnl_pct_raw,
                         'velas_duracion': i, 'fecha_salida': df.index[idx_entrada + i],
                         'tipo_salida': 'trailing' if breakeven_activado else 'sl_fijo',
                         'direccion': 'long'}
@@ -457,7 +460,7 @@ def simular_trade(df, idx_entrada, entry_price, direccion='long'):
 
 def backtest(df_4h):
     log("="*60)
-    log(f"INICIANDO BACKTEST v10.3 - Rupturas Diagonales RSI 4H + Volumen + Apalancamiento {CONFIG['leverage']}x")
+    log(f"INICIANDO BACKTEST v10.4 - Rupturas Diagonales RSI 4H + Volumen + Apalancamiento {CONFIG['leverage']}x")
     log("="*60)
 
     trades = []
@@ -479,6 +482,7 @@ def backtest(df_4h):
     log(f"Periodo: {df_4h.index[0]} -> {df_4h.index[-1]}")
     log(f"Dirección: {CONFIG['direccion']}")
     log(f"Apalancamiento: {CONFIG['leverage']}x")
+    log(f"Filtro tendencia: {'ACTIVO' if CONFIG['usar_filtro_tendencia'] else 'DESACTIVADO'}")
     log(f"Analizando...")
 
     for i in range(ventana_min, len(df_4h) - 1):
@@ -530,7 +534,7 @@ def backtest(df_4h):
             elif rsi_actual >= CONFIG['zona_sobreventa']:
                 rechazos['zona_rsi'] += 1
                 ruptura_long = False
-            elif tendencia == 'bajista':
+            elif CONFIG['usar_filtro_tendencia'] and tendencia == 'bajista':
                 rechazos['tendencia'] += 1
                 ruptura_long = False
             else:
@@ -557,7 +561,7 @@ def backtest(df_4h):
             elif rsi_actual <= CONFIG['zona_sobrecompra']:
                 rechazos['zona_rsi'] += 1
                 ruptura_short = False
-            elif tendencia == 'alcista':
+            elif CONFIG['usar_filtro_tendencia'] and tendencia == 'alcista':
                 rechazos['tendencia'] += 1
                 ruptura_short = False
             else:
@@ -646,9 +650,7 @@ def calcular_metricas(trades, balance_inicial=1000):
     leverage = CONFIG['leverage']
 
     for trade in trades:
-        # El riesgo se calcula sobre el balance, pero el P&L ya incluye apalancamiento
         riesgo = balance * CONFIG['risk_per_trade']
-        # Ajustar el riesgo por apalancamiento: con 5x, el SL real es 5 veces más grande
         pnl_usd = riesgo * (trade['pnl_pct'] / (CONFIG['sl_pct'] * 100 * leverage))
         balance += pnl_usd
         balances.append(balance)
@@ -700,7 +702,7 @@ def calcular_metricas(trades, balance_inicial=1000):
 
 def main():
     log("="*60)
-    log("BOT RSI CANALES - BACKTEST v10.3")
+    log("BOT RSI CANALES - BACKTEST v10.4 (OPTIMIZADO VOLATILES)")
     log(f"Par: {CONFIG['symbol']}")
     log(f"Timeframe: {CONFIG['timeframe']}")
     log(f"SL: {CONFIG['sl_pct']*100:.1f}% | TP: {CONFIG['tp_pct']*100:.1f}%")
@@ -710,9 +712,11 @@ def main():
     log(f"Zona LONG: RSI < {CONFIG['zona_sobreventa']}")
     log(f"Zona SHORT: RSI > {CONFIG['zona_sobrecompra']}")
     log(f"R2 mínimo diagonal: {CONFIG['r2_min_diagonal']}")
+    log(f"Puntos mínimos diagonal: {CONFIG['min_puntos_diagonal']}")
+    log(f"Pivot ventana: {CONFIG['pivot_ventana']}")
     log(f"Trailing stop: {CONFIG['trailing_stop_pct']*100:.1f}%")
     log(f"Cooldown: {CONFIG['cooldown_horas']}h")
-    log(f"Filtro tendencia: ACTIVO (no contratendencia)")
+    log(f"Filtro tendencia: {'ACTIVO' if CONFIG['usar_filtro_tendencia'] else 'DESACTIVADO'}")
     log("="*60)
 
     try:
@@ -745,7 +749,7 @@ def main():
 
     log("")
     log("="*60)
-    log("RESULTADOS DEL BACKTEST v10.3")
+    log("RESULTADOS DEL BACKTEST v10.4")
     log("="*60)
     log(f"Periodo: {df.index[0].strftime('%Y-%m-%d')} -> {df.index[-1].strftime('%Y-%m-%d')}")
     log(f"Total velas {CONFIG['timeframe']}: {len(df)}")
@@ -757,10 +761,11 @@ def main():
         log("NO HUBO NINGUNA SEÑAL EN ESTE PERIODO")
         log("")
         log("SUGERENCIAS:")
-        log("1. Reducir min_puntos_diagonal (actual: 3)")
-        log("2. Reducir r2_min_diagonal (actual: 0.15)")
+        log("1. Reducir min_puntos_diagonal (actual: 2)")
+        log("2. Reducir r2_min_diagonal (actual: 0.10)")
         log("3. Aumentar ventana de datos (más histórico)")
-        log("4. Reducir volumen_min_ratio (actual: 1.5)")
+        log("4. Reducir volumen_min_ratio (actual: 1.2)")
+        log("5. Desactivar filtro de tendencia: FILTRO_TENDENCIA=false")
     else:
         metricas = calcular_metricas(trades)
         leverage = CONFIG['leverage']
@@ -780,8 +785,8 @@ def main():
         log(f"Balance final: ${metricas['balance_final']:.2f}")
         log(f"Return total: {metricas['pnl_total_pct']:.2f}%")
         log(f"P&L LONGS: {metricas['pnl_longs']:+.2f}% | P&L SHORTS: {metricas['pnl_shorts']:+.2f}%")
-        log(f"Promedio ganador: {metricas['avg_win']:.2f}% (sin apalancamiento: {metricas['avg_win']/leverage:.2f}%)")
-        log(f"Promedio perdedor: {metricas['avg_loss']:.2f}% (sin apalancamiento: {metricas['avg_loss']/leverage:.2f}%)")
+        log(f"Promedio ganador: {metricas['avg_win']:.2f}% (spot: {metricas['avg_win']/leverage:.2f}%)")
+        log(f"Promedio perdedor: {metricas['avg_loss']:.2f}% (spot: {metricas['avg_loss']/leverage:.2f}%)")
         log(f"")
 
         log("DETALLE DE TRADES:")
