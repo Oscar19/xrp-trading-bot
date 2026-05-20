@@ -1,9 +1,46 @@
+name: Backtest RSI v10
 
+on:
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: 'Par de trading'
+        required: true
+        default: 'XRP/USDT'
+      direccion:
+        description: 'Direccion (long/short/both)'
+        required: true
+        default: 'long'
+      volumen_ratio:
+        description: 'Ratio minimo de volumen'
+        required: true
+        default: '1.5'
 
-- name: Ejecutar backtest
-  env:
-    BITGET_SYMBOL: ${{ github.event.inputs.symbol || 'SOL/USDT' }}
-    DIRECCION: ${{ github.event.inputs.direccion || 'both' }}
-    LEVERAGE: '5'
-    VOLUMEN_MIN_RATIO: '1.5'
-  run: python bot_rsi_canales_v10_3.py
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        
+    - name: Instalar dependencias
+      run: pip install pandas numpy ccxt scipy
+      
+    - name: Ejecutar backtest
+      env:
+        BITGET_SYMBOL: ${{ github.event.inputs.symbol }}
+        DIRECCION: ${{ github.event.inputs.direccion }}
+        VOLUMEN_MIN_RATIO: ${{ github.event.inputs.volumen_ratio }}
+      run: python bot_rsi_canales_v10.py
+      
+    - name: Guardar logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: resultados-backtest
+        path: '*.txt'
+        retention-days: 7
