@@ -1,11 +1,11 @@
 """
-BOT RSI CANALES - BACKTEST v6
+BOT RSI CANALES - BACKTEST v7
 ==============================
-Fixes:
-- Detección de tendencia relajada (menos "lateral")
-- Forzar descarga de 2500+ velas 1h
-- Modo auto más permisivo
-- Opción de operar en lateral (range trading)
+Cambio fundamental: Usar SOLO timeframe 1h
+- Detectar canal en RSI 1h (en vez de 4h)
+- Detectar diagonal en RSI 1h (sub-timeframe dentro de 1h)
+- Eliminar dependencia de mapeo temporal 4h->1h
+- Más datos disponibles, backtest más largo
 """
 
 import pandas as pd
@@ -23,28 +23,15 @@ CONFIG = {
     'risk_per_trade': float(os.environ.get('RISK_PER_TRADE', '0.02')),
     'sl_pct': float(os.environ.get('SL_PCT', '0.008')),
     'tp_pct': float(os.environ.get('TP_PCT', '0.015')),
-    'min_r2_canal': float(os.environ.get('MIN_R2_CANAL', '0.05')),
-    'min_r2_diagonal': float(os.environ.get('MIN_R2_DIAGONAL', '0.10')),
-    'umbral_rebote': float(os.environ.get('UMBRAL_REBOTE', '1.0')),
     'trailing_stop_pct': 0.005,
     'breakeven_trigger': 0.008,
     'time_exit_max': 20,
-    'max_rsi_1h': 55,
-    'min_rsi_4h': 30,
-    'min_ancho_canal': 10,
-    'max_ancho_canal': 30,
-    'cooldown_horas': 24,
-    
-    # NUEVO: Qué hacer en mercado lateral
-    # 'auto' = detecta tendencia, opera en dirección, en lateral no opera
-    # 'auto_range' = en lateral opera en ambas direcciones según rebote del canal
-    # 'short' = solo short (para XRP bajista)
-    # 'long' = solo long
-    # 'both' = opera long y short sin filtro de tendencia
-    'direccion': os.environ.get('DIRECCION', 'short'),
-    
+    'cooldown_horas': 12,
+
+    # Dirección: 'long', 'short', 'both'
+    'direccion': os.environ.get('DIRECCION', 'both'),
+
     'debug': os.environ.get('DEBUG', 'false').lower() == 'true',
-    'use_filters': os.environ.get('USE_FILTERS', 'true').lower() == 'true',
 }
 
 def log(msg):
@@ -68,40 +55,17 @@ def calcular_rsi(prices, period=14):
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
-def calcular_atr(df, period=14):
-    high_low = df['high'] - df['low']
-    high_close = np.abs(df['high'] - df['close'].shift())
-    low_close = np.abs(df['low'] - df['close'].shift())
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    return tr.rolling(window=period).mean()
-
-def detectar_tendencia(df_4h, idx, periodos=20):
+def detectar_canal_rsi(rsi_values, ventana_pivot=5, min_puntos=3,
+                        pendiente_max=-0.005, diff_max=0.5, r2_min=0.05):
     """
-    Detección de tendencia RELAJADA:
-    - Usa pendiente de EMA20 vs EMA50
-    - Solo bajista si precio < EMA20*0.99 y EMA20 < EMA50*0.995
-    - Solo alcista si precio > EMA20*1.01 y EMA20 > EMA50*1.005
+    Detectar canal descendente en RSI (cualquier timeframe)
     """
-    precio = df_4h['close'].iloc[idx]
-    ema20 = df_4h['ema20'].iloc[idx]
-    ema50 = df_4h['ema50'].iloc[idx]
-    
-    # Relajar umbrales
-    if precio < ema20 * 0.99 and ema20 < ema50 * 0.995:
-        return 'bajista'
-    elif precio > ema20 * 1.01 and ema20 > ema50 * 1.005:
-        return 'alcista'
-    else:
-        return 'lateral'
-
-def detectar_canal_4h(rsi_values, ventana_pivot=3, min_puntos=3,
-                       pendiente_max=-0.005, diff_max=0.5, r2_min=0.05):
     rsi = np.array(rsi_values)
     n = len(rsi)
-    
+
     techos_idx, techos_val = [], []
     suelos_idx, suelos_val = [], []
-    
+
     for i in range(ventana_pivot, n - ventana_pivot):
         ventana = rsi[i-ventana_pivot:i+ventana_pivot+1]
         if rsi[i] == ventana.max() and rsi[i] > 40:
@@ -110,35 +74,35 @@ def detectar_canal_4h(rsi_values, ventana_pivot=3, min_puntos=3,
         if rsi[i] == ventana.min() and rsi[i] < 65:
             suelos_idx.append(i)
             suelos_val.append(rsi[i])
-    
+
     if len(techos_idx) < min_puntos or len(suelos_idx) < min_puntos:
         return None, f"Pocos pivots (techos={len(techos_idx)}, suelos={len(suelos_idx)})"
-    
+
     n_techos = min(8, len(techos_idx))
     n_suelos = min(8, len(suelos_idx))
-    
+
     x_t = np.array(techos_idx[-n_techos:])
     y_t = np.array(techos_val[-n_techos:])
     x_s = np.array(suelos_idx[-n_suelos:])
     y_s = np.array(suelos_val[-n_suelos:])
-    
+
     m_t, b_t, r_t, p_t, se_t = stats.linregress(x_t, y_t)
     m_s, b_s, r_s, p_s, se_s = stats.linregress(x_s, y_s)
-    
+
     if m_t > pendiente_max:
         return None, f"Techo no descendente ({m_t:.4f} > {pendiente_max})"
-    
+
     if m_s > 0.02:
         return None, f"Suelo subiendo demasiado ({m_s:.4f})"
-    
+
     if abs(m_t - m_s) > diff_max:
         return None, f"Lineas no paralelas (diff={abs(m_t-m_s):.4f})"
-    
+
     if r_t**2 < r2_min:
         return None, f"Correlacion baja (R2={r_t**2:.3f})"
-    
+
     ancho_canal = (m_t * (n-1) + b_t) - (m_s * (n-1) + b_s)
-    
+
     return {
         'techo_m': m_t, 'techo_b': b_t,
         'suelo_m': m_s, 'suelo_b': b_s,
@@ -148,29 +112,33 @@ def detectar_canal_4h(rsi_values, ventana_pivot=3, min_puntos=3,
         'ancho_canal': ancho_canal
     }, "OK"
 
-def detectar_rebote_4h(rsi_values, canal, umbral_zona=1.0):
+def detectar_rebote_canal(rsi_values, canal, umbral_zona=1.0):
     if not canal:
         return False, None
-    
+
     x = len(rsi_values) - 1
     suelo = canal['suelo_m'] * x + canal['suelo_b']
     techo = canal['techo_m'] * x + canal['techo_b']
     rsi_actual = rsi_values[-1]
-    
+
+    # Zona de rebote: cerca del suelo del canal
     en_zona = rsi_actual <= suelo * umbral_zona and rsi_actual < 48
     en_zona_baja = rsi_actual < 42
-    
+
     return en_zona or en_zona_baja, {
         'suelo': suelo, 'techo': techo,
         'rsi_actual': rsi_actual,
         'ancho_canal': canal.get('ancho_canal', techo - suelo)
     }
 
-def detectar_diagonal_1h(rsi_values, ventana_pivot=5, min_puntos=3,
-                          pendiente_max=0.01, r2_min=0.10):
+def detectar_diagonal_rsi(rsi_values, ventana_pivot=3, min_puntos=3,
+                           pendiente_max=0.01, r2_min=0.10):
+    """
+    Detectar línea descendente de máximos en RSI
+    """
     rsi = np.array(rsi_values)
     n = len(rsi)
-    
+
     maximos_idx, maximos_val = [], []
     for i in range(ventana_pivot, n - ventana_pivot):
         ventana = rsi[i-ventana_pivot:i+ventana_pivot+1]
@@ -178,22 +146,23 @@ def detectar_diagonal_1h(rsi_values, ventana_pivot=5, min_puntos=3,
             if not maximos_idx or rsi[i] <= maximos_val[-1] * 1.15:
                 maximos_idx.append(i)
                 maximos_val.append(rsi[i])
-    
+
     if len(maximos_idx) < min_puntos:
         return None, f"Pocos maximos ({len(maximos_idx)})"
-    
+
     for n_usar in range(min_puntos, min(20, len(maximos_idx)) + 1):
         x = np.array(maximos_idx[-n_usar:])
         y = np.array(maximos_val[-n_usar:])
         m, b, r, p, se = stats.linregress(x, y)
-        
+
         if m <= pendiente_max and r**2 >= r2_min:
             return {
                 'm': m, 'b': b, 'r2': r**2,
                 'maximos_idx': maximos_idx, 'maximos_val': maximos_val,
                 'n_usados': n_usar
             }, "OK"
-    
+
+    # Fallback
     x = np.array(maximos_idx[-min_puntos:])
     y = np.array(maximos_val[-min_puntos:])
     m, b, r, p, se = stats.linregress(x, y)
@@ -203,357 +172,311 @@ def detectar_diagonal_1h(rsi_values, ventana_pivot=5, min_puntos=3,
             'maximos_idx': maximos_idx, 'maximos_val': maximos_val,
             'n_usados': min_puntos
         }, "OK (fallback)"
-    
+
     return None, f"Tendencia muy ascendente ({m:.4f})"
 
-def detectar_ruptura_1h(rsi_values, diagonal, umbral=0.0):
+def detectar_ruptura_diagonal(rsi_values, diagonal, umbral=0.0):
     if not diagonal:
         return False, None
-    
+
     n = len(rsi_values)
     val_diag_2 = diagonal['m'] * (n-2) + diagonal['b']
     val_diag_1 = diagonal['m'] * (n-1) + diagonal['b']
-    
+
     rsi_2 = rsi_values[-2]
     rsi_1 = rsi_values[-1]
-    
+
+    # Ruptura: RSI cruza por encima de la diagonal
     ruptura = rsi_2 <= val_diag_2 and rsi_1 > val_diag_1
-    
+
     if ruptura:
         return True, {
             'rsi_antes': rsi_2, 'rsi_despues': rsi_1,
             'diag_antes': val_diag_2, 'diag_despues': val_diag_1,
             'diferencia': rsi_1 - val_diag_1
         }
-    
-    val_diag_3 = diagonal['m'] * (n-3) + diagonal['b']
-    if rsi_1 > val_diag_1 and len(rsi_values) > 3 and rsi_values[-3] > val_diag_3:
-        return True, {
-            'rsi_antes': rsi_values[-3], 'rsi_despues': rsi_1,
-            'diag_antes': val_diag_3, 'diag_despues': val_diag_1,
-            'diferencia': rsi_1 - val_diag_1,
-            'nota': 'Ruptura previa confirmada'
-        }
-    
+
     return False, None
 
-def simular_trade(df_1h, idx_entrada, entry_price, direccion='long'):
-    if idx_entrada >= len(df_1h) - 1:
+def detectar_tendencia_precio(df, idx, periodos=50):
+    """
+    Detectar tendencia del precio usando pendiente de regresión lineal
+    """
+    if idx < periodos:
+        return 'lateral'
+
+    precios = df['close'].iloc[idx-periodos:idx+1].values
+    x = np.arange(len(precios))
+    m, b, r, p, se = stats.linregress(x, precios)
+
+    # Normalizar pendiente por precio
+    pendiente_pct = m / precios[-1] * 100
+
+    if pendiente_pct > 0.05:
+        return 'alcista'
+    elif pendiente_pct < -0.05:
+        return 'bajista'
+    else:
+        return 'lateral'
+
+def simular_trade(df, idx_entrada, entry_price, direccion='long'):
+    if idx_entrada >= len(df) - 1:
         return None
-    
+
     if direccion == 'long':
         sl_price = entry_price * (1 - CONFIG['sl_pct'])
         tp_price = entry_price * (1 + CONFIG['tp_pct'])
-        min_recent = df_1h['low'].iloc[max(0, idx_entrada-5):idx_entrada].min()
+        min_recent = df['low'].iloc[max(0, idx_entrada-5):idx_entrada].min()
         sl_final = max(sl_price, min_recent * 0.999)
-        
+
         max_price = entry_price
         breakeven_activado = False
         sl_trailing = sl_final
-        
-        for i in range(1, min(CONFIG['time_exit_max'], len(df_1h) - idx_entrada)):
-            vela = df_1h.iloc[idx_entrada + i]
-            
+
+        for i in range(1, min(CONFIG['time_exit_max'], len(df) - idx_entrada)):
+            vela = df.iloc[idx_entrada + i]
+
             if vela['high'] > max_price:
                 max_price = vela['high']
-            
+
             ganancia_pct = (max_price - entry_price) / entry_price
             if ganancia_pct >= CONFIG['breakeven_trigger'] and not breakeven_activado:
                 breakeven_activado = True
                 sl_trailing = entry_price * 1.001
-            
+
             if breakeven_activado:
                 nuevo_sl = max_price * (1 - CONFIG['trailing_stop_pct'])
                 if nuevo_sl > sl_trailing:
                     sl_trailing = nuevo_sl
-            
+
             if vela['low'] <= sl_trailing:
                 pnl_pct = (sl_trailing - entry_price) / entry_price * 100
                 return {'resultado': 'SL', 'exit_price': sl_trailing, 'pnl_pct': pnl_pct,
-                        'velas_duracion': i, 'fecha_salida': df_1h.index[idx_entrada + i],
+                        'velas_duracion': i, 'fecha_salida': df.index[idx_entrada + i],
                         'tipo_salida': 'trailing' if breakeven_activado else 'sl_fijo',
                         'direccion': 'long'}
-            
+
             if vela['high'] >= tp_price:
                 return {'resultado': 'TP', 'exit_price': tp_price, 'pnl_pct': CONFIG['tp_pct'] * 100,
-                        'velas_duracion': i, 'fecha_salida': df_1h.index[idx_entrada + i],
+                        'velas_duracion': i, 'fecha_salida': df.index[idx_entrada + i],
                         'tipo_salida': 'tp_fijo', 'direccion': 'long'}
-    
-    else:
+
+    else:  # short
         sl_price = entry_price * (1 + CONFIG['sl_pct'])
         tp_price = entry_price * (1 - CONFIG['tp_pct'])
-        max_recent = df_1h['high'].iloc[max(0, idx_entrada-5):idx_entrada].max()
+        max_recent = df['high'].iloc[max(0, idx_entrada-5):idx_entrada].max()
         sl_final = min(sl_price, max_recent * 1.001)
-        
+
         min_price = entry_price
         breakeven_activado = False
         sl_trailing = sl_final
-        
-        for i in range(1, min(CONFIG['time_exit_max'], len(df_1h) - idx_entrada)):
-            vela = df_1h.iloc[idx_entrada + i]
-            
+
+        for i in range(1, min(CONFIG['time_exit_max'], len(df) - idx_entrada)):
+            vela = df.iloc[idx_entrada + i]
+
             if vela['low'] < min_price:
                 min_price = vela['low']
-            
+
             ganancia_pct = (entry_price - min_price) / entry_price
             if ganancia_pct >= CONFIG['breakeven_trigger'] and not breakeven_activado:
                 breakeven_activado = True
                 sl_trailing = entry_price * 0.999
-            
+
             if breakeven_activado:
                 nuevo_sl = min_price * (1 + CONFIG['trailing_stop_pct'])
                 if nuevo_sl < sl_trailing:
                     sl_trailing = nuevo_sl
-            
+
             if vela['high'] >= sl_trailing:
                 pnl_pct = (entry_price - sl_trailing) / entry_price * 100
                 return {'resultado': 'SL', 'exit_price': sl_trailing, 'pnl_pct': pnl_pct,
-                        'velas_duracion': i, 'fecha_salida': df_1h.index[idx_entrada + i],
+                        'velas_duracion': i, 'fecha_salida': df.index[idx_entrada + i],
                         'tipo_salida': 'trailing' if breakeven_activado else 'sl_fijo',
                         'direccion': 'short'}
-            
+
             if vela['low'] <= tp_price:
                 return {'resultado': 'TP', 'exit_price': tp_price, 'pnl_pct': CONFIG['tp_pct'] * 100,
-                        'velas_duracion': i, 'fecha_salida': df_1h.index[idx_entrada + i],
+                        'velas_duracion': i, 'fecha_salida': df.index[idx_entrada + i],
                         'tipo_salida': 'tp_fijo', 'direccion': 'short'}
-    
-    idx_salida = idx_entrada + min(CONFIG['time_exit_max'], len(df_1h) - idx_entrada - 1)
-    exit_price = df_1h['close'].iloc[idx_salida]
-    
+
+    # Time exit
+    idx_salida = idx_entrada + min(CONFIG['time_exit_max'], len(df) - idx_entrada - 1)
+    exit_price = df['close'].iloc[idx_salida]
+
     if direccion == 'long':
         pnl_pct = (exit_price - entry_price) / entry_price * 100
     else:
         pnl_pct = (entry_price - exit_price) / entry_price * 100
-    
+
     return {
         'resultado': 'TIME_EXIT',
         'exit_price': exit_price,
         'pnl_pct': pnl_pct,
-        'velas_duracion': min(CONFIG['time_exit_max'], len(df_1h) - idx_entrada - 1),
-        'fecha_salida': df_1h.index[idx_salida],
+        'velas_duracion': min(CONFIG['time_exit_max'], len(df) - idx_entrada - 1),
+        'fecha_salida': df.index[idx_salida],
         'tipo_salida': 'time_exit',
         'direccion': direccion
     }
 
-def backtest_completo(df_4h, df_1h):
+def backtest(df_1h):
     log("="*60)
-    log("INICIANDO BACKTEST v6")
+    log("INICIANDO BACKTEST v7 - Solo timeframe 1h")
     log("="*60)
-    
+
     trades = []
     rechazos = {
         'canal': 0, 'rebote': 0, 'diagonal': 0, 'ruptura': 0,
-        'filtro_rsi_1h': 0, 'filtro_rsi_4h': 0, 'filtro_ancho': 0,
-        'filtro_cooldown': 0, 'filtro_tendencia': 0, 'datos_1h': 0
+        'cooldown': 0, 'tendencia': 0
     }
-    
-    rsi_4h = df_4h['rsi'].values
-    closes_4h = df_4h['close'].values
-    rsi_1h = df_1h['rsi'].values
-    closes_1h = df_1h['close'].values
-    
-    df_4h['ema20'] = df_4h['close'].ewm(span=20).mean()
-    df_4h['ema50'] = df_4h['close'].ewm(span=50).mean()
-    df_1h['atr'] = calcular_atr(df_1h)
-    df_1h['atr_avg'] = df_1h['atr'].rolling(50).mean()
-    df_1h['vol_avg'] = df_1h['volume'].rolling(20).mean()
-    
+
+    rsi = df_1h['rsi'].values
+    closes = df_1h['close'].values
+
     ventana_min = 50
     ultimo_trade_fecha = None
-    
-    tendencias = {'alcista': 0, 'bajista': 0, 'lateral': 0}
-    
-    log(f"Total velas 4h: {len(df_4h)}")
+
     log(f"Total velas 1h: {len(df_1h)}")
-    log(f"Periodo 4h: {df_4h.index[0]} -> {df_4h.index[-1]}")
-    log(f"Periodo 1h: {df_1h.index[0]} -> {df_1h.index[-1]}")
+    log(f"Periodo: {df_1h.index[0]} -> {df_1h.index[-1]}")
     log(f"Dirección: {CONFIG['direccion']}")
     log(f"Analizando...")
-    
-    for i in range(ventana_min, len(df_4h) - 1):
-        fecha_4h = df_4h.index[i]
-        
-        # Detectar tendencia
-        tendencia = detectar_tendencia(df_4h, i)
-        tendencias[tendencia] += 1
-        
-        # Determinar dirección del trade
-        if CONFIG['direccion'] == 'auto':
-            direccion_trade = 'short' if tendencia == 'bajista' else 'long' if tendencia == 'alcista' else None
-        elif CONFIG['direccion'] == 'auto_range':
-            # En lateral: opera según posición en el canal
-            direccion_trade = 'range'  # Se decide más abajo según rebote
-        elif CONFIG['direccion'] == 'short':
-            direccion_trade = 'short'
-        elif CONFIG['direccion'] == 'both':
-            direccion_trade = 'both'  # Opera long y short sin filtro
-        else:
-            direccion_trade = 'long'
-        
-        if direccion_trade is None and CONFIG['direccion'] == 'auto':
-            rechazos['filtro_tendencia'] += 1
-            continue
-        
+
+    for i in range(ventana_min, len(df_1h) - 1):
+        fecha = df_1h.index[i]
+
         # COOLDOWN
         if ultimo_trade_fecha is not None:
-            horas_desde_ultimo = (fecha_4h - ultimo_trade_fecha).total_seconds() / 3600
+            horas_desde_ultimo = (fecha - ultimo_trade_fecha).total_seconds() / 3600
             if horas_desde_ultimo < CONFIG['cooldown_horas']:
-                rechazos['filtro_cooldown'] += 1
+                rechazos['cooldown'] += 1
                 continue
-        
-        rsi_4h_window = rsi_4h[:i+1]
-        
-        canal, msg = detectar_canal_4h(rsi_4h_window)
+
+        rsi_window = rsi[:i+1]
+
+        # Detectar canal en RSI 1h
+        canal, msg = detectar_canal_rsi(rsi_window)
         if not canal:
             rechazos['canal'] += 1
             continue
-        
-        rebote, info_4h = detectar_rebote_4h(rsi_4h_window, canal)
+
+        # Verificar rebote en canal
+        rebote, info_canal = detectar_rebote_canal(rsi_window, canal)
         if not rebote:
             rechazos['rebote'] += 1
             continue
-        
-        if CONFIG['use_filters'] and info_4h['rsi_actual'] < CONFIG['min_rsi_4h']:
-            rechazos['filtro_rsi_4h'] += 1
-            continue
-        
-        ancho = info_4h.get('ancho_canal', 0)
-        if CONFIG['use_filters'] and (ancho < CONFIG['min_ancho_canal'] or ancho > CONFIG['max_ancho_canal']):
-            rechazos['filtro_ancho'] += 1
-            continue
-        
-        idx_1h_candidatos = df_1h.index.get_indexer([fecha_4h], method='nearest')
-        if len(idx_1h_candidatos) == 0 or idx_1h_candidatos[0] == -1:
-            continue
-        idx_1h = idx_1h_candidatos[0]
-        
-        if idx_1h < 50:
-            continue
-        
-        if idx_1h >= len(rsi_1h):
-            rechazos['datos_1h'] += 1
-            continue
-        
-        rsi_1h_window = rsi_1h[:idx_1h+1]
-        
-        diagonal, msg = detectar_diagonal_1h(rsi_1h_window)
+
+        # Detectar diagonal en RSI 1h (más corta, más reciente)
+        # Usar solo últimas 30 velas para la diagonal
+        rsi_reciente = rsi[max(0, i-30):i+1]
+        diagonal, msg = detectar_diagonal_rsi(rsi_reciente, ventana_pivot=3, min_puntos=2, r2_min=0.05)
         if not diagonal:
             rechazos['diagonal'] += 1
             continue
-        
-        ruptura, info_1h = detectar_ruptura_1h(rsi_1h_window, diagonal)
+
+        # Verificar ruptura de diagonal
+        ruptura, info_diag = detectar_ruptura_diagonal(rsi_reciente, diagonal)
         if not ruptura:
             rechazos['ruptura'] += 1
             continue
-        
-        if CONFIG['use_filters'] and info_1h['rsi_despues'] > CONFIG['max_rsi_1h']:
-            rechazos['filtro_rsi_1h'] += 1
-            continue
-        
-        # Determinar dirección final
+
+        # Determinar dirección del trade
+        tendencia = detectar_tendencia_precio(df_1h, i)
+
         if CONFIG['direccion'] == 'both':
-            # En modo both: si RSI 1h rompe diagonal hacia arriba = LONG
-            # Si estamos cerca del techo del canal en 4h = SHORT
-            if info_4h['rsi_actual'] < info_4h['suelo'] * 1.1:
+            # En lateral/bajista: SHORT cuando RSI rompe diagonal hacia arriba cerca del techo
+            # En lateral/alcista: LONG cuando RSI rompe diagonal hacia arriba cerca del suelo
+            if info_canal['rsi_actual'] < info_canal['suelo'] * 1.05:
                 direccion_final = 'long'
             else:
                 direccion_final = 'short'
-        elif CONFIG['direccion'] == 'auto_range':
-            if info_4h['rsi_actual'] < info_4h['suelo'] * 1.05:
-                direccion_final = 'long'
-            else:
-                direccion_final = 'short'
+        elif CONFIG['direccion'] == 'short':
+            direccion_final = 'short'
         else:
-            direccion_final = direccion_trade
-        
+            direccion_final = 'long'
+
         # SEÑAL ENCONTRADA
-        entry_price = closes_1h[idx_1h]
-        
-        resultado_trade = simular_trade(df_1h, idx_1h, entry_price, direccion_final)
-        
+        entry_price = closes[i]
+
+        resultado_trade = simular_trade(df_1h, i, entry_price, direccion_final)
+
         if resultado_trade:
-            ultimo_trade_fecha = fecha_4h
+            ultimo_trade_fecha = fecha
             trades.append({
-                'fecha_entrada': fecha_4h,
-                'idx_4h': i,
-                'idx_1h': idx_1h,
+                'fecha_entrada': fecha,
+                'idx': i,
                 'entry': entry_price,
                 'sl': entry_price * (1 - CONFIG['sl_pct']) if direccion_final == 'long' else entry_price * (1 + CONFIG['sl_pct']),
                 'tp': entry_price * (1 + CONFIG['tp_pct']) if direccion_final == 'long' else entry_price * (1 - CONFIG['tp_pct']),
-                'rsi_4h': info_4h['rsi_actual'],
-                'rsi_1h': info_1h['rsi_despues'],
-                'techo_canal': info_4h['techo'],
-                'suelo_canal': info_4h['suelo'],
-                'ancho_canal': ancho,
+                'rsi': info_canal['rsi_actual'],
+                'techo_canal': info_canal['techo'],
+                'suelo_canal': info_canal['suelo'],
+                'ancho_canal': info_canal['ancho_canal'],
                 'tendencia': tendencia,
                 **resultado_trade
             })
-    
-    log(f"")
-    log(f"Tendencias detectadas: Alcista={tendencias['alcista']}, Bajista={tendencias['bajista']}, Lateral={tendencias['lateral']}")
-    
+
     if CONFIG['debug'] or len(trades) < 5:
+        log(f"")
         log(f"DEBUG - Rechazos:")
         for k, v in rechazos.items():
             log(f"  {k}: {v}")
-    
+
     return trades
 
 def calcular_metricas(trades, balance_inicial=1000):
     if not trades:
         return None
-    
+
     n_trades = len(trades)
     ganadores = [t for t in trades if t['pnl_pct'] > 0]
     perdedores = [t for t in trades if t['pnl_pct'] <= 0]
-    
+
     n_ganadores = len(ganadores)
     n_perdedores = len(perdedores)
     win_rate = n_ganadores / n_trades * 100
-    
+
     pnl_total = sum(t['pnl_pct'] for t in trades)
     pnl_promedio = pnl_total / n_trades
-    
+
     balance = balance_inicial
     max_balance = balance
     min_balance = balance
     max_drawdown = 0
     max_drawdown_usd = 0
-    
+
     balances = [balance]
-    
+
     for trade in trades:
         riesgo = balance * CONFIG['risk_per_trade']
         pnl_usd = riesgo * (trade['pnl_pct'] / (CONFIG['sl_pct'] * 100))
         balance += pnl_usd
-        
+
         balances.append(balance)
-        
+
         if balance > max_balance:
             max_balance = balance
-        
+
         drawdown = (max_balance - balance) / max_balance * 100
         if drawdown > max_drawdown:
             max_drawdown = drawdown
             max_drawdown_usd = max_balance - balance
-        
+
         if balance < min_balance:
             min_balance = balance
-    
+
     ganancias_totales = sum(t['pnl_pct'] for t in ganadores)
     perdidas_totales = abs(sum(t['pnl_pct'] for t in perdedores))
     profit_factor = ganancias_totales / perdidas_totales if perdidas_totales > 0 else float('inf')
-    
+
     avg_win = np.mean([t['pnl_pct'] for t in ganadores]) if ganadores else 0
     avg_loss = np.mean([t['pnl_pct'] for t in perdedores]) if perdedores else 0
     expectancy = (win_rate/100 * avg_win) + ((1-win_rate/100) * avg_loss)
-    
+
     returns = [t['pnl_pct'] for t in trades]
-    sharpe = np.mean(returns) / np.std(returns) * np.sqrt(252) if np.std(returns) > 0 else 0
-    
+    sharpe = np.mean(returns) / np.std(returns) * np.sqrt(252*24) if np.std(returns) > 0 else 0  # Anualizado para 1h
+
     longs = [t for t in trades if t.get('direccion') == 'long']
     shorts = [t for t in trades if t.get('direccion') == 'short']
-    
+
     return {
         'n_trades': n_trades,
         'n_ganadores': n_ganadores,
@@ -579,13 +502,13 @@ def calcular_metricas(trades, balance_inicial=1000):
 
 def main():
     log("="*60)
-    log("BOT RSI CANALES - BACKTEST v6")
+    log("BOT RSI CANALES - BACKTEST v7 (Solo 1h)")
     log(f"Par: {CONFIG['symbol']}")
     log(f"SL: {CONFIG['sl_pct']*100:.1f}% | TP: {CONFIG['tp_pct']*100:.1f}%")
     log(f"Dirección: {CONFIG['direccion']}")
-    log(f"Debug: {CONFIG['debug']} | Filtros: {CONFIG['use_filters']}")
+    log(f"Debug: {CONFIG['debug']}")
     log("="*60)
-    
+
     try:
         exchange = ccxt.bitget({
             'options': {'defaultType': 'swap'},
@@ -596,66 +519,45 @@ def main():
     except Exception as e:
         log(f"Error conectando: {e}")
         return
-    
-    log("Descargando datos históricos...")
-    
-    # CORRECCION: Descargar en batches si es necesario para obtener más datos
-    df_4h = fetch_data(exchange, CONFIG['symbol'], '4h', limit=600)
-    
-    # Intentar descargar más datos 1h
+
+    log("Descargando datos 1h...")
+
+    # Descargar datos 1h - intentar obtener máximo posible
     df_1h = fetch_data(exchange, CONFIG['symbol'], '1h', limit=1000)
-    if df_1h is not None and len(df_1h) < 1500:
-        log(f"Descargados {len(df_1h)} velas 1h, intentando obtener más...")
-        # Bitget a veces limita a 1000, intentar con since
-        try:
-            since = exchange.parse8601('2026-01-01T00:00:00Z')
-            ohlcv = exchange.fetch_ohlcv(CONFIG['symbol'], '1h', since=since, limit=2500)
-            if ohlcv and len(ohlcv) > len(df_1h):
-                df_1h = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                df_1h['timestamp'] = pd.to_datetime(df_1h['timestamp'], unit='ms')
-                df_1h.set_index('timestamp', inplace=True)
-                log(f"Descargadas {len(df_1h)} velas 1h con since")
-        except Exception as e:
-            log(f"No se pudieron descargar más datos 1h: {e}")
-    
-    if df_4h is None or df_1h is None:
+
+    if df_1h is None:
         log("Error descargando datos")
         return
-    
-    log(f"4h: {len(df_4h)} velas | {df_4h.index[0]} -> {df_4h.index[-1]}")
+
     log(f"1h: {len(df_1h)} velas | {df_1h.index[0]} -> {df_1h.index[-1]}")
-    
-    # Verificar solapamiento
-    overlap = df_1h.index[-1] - df_4h.index[0]
-    log(f"Solapamiento 1h vs 4h: {overlap}")
-    
-    df_4h['rsi'] = calcular_rsi(df_4h['close'])
+
+    # Calcular RSI
     df_1h['rsi'] = calcular_rsi(df_1h['close'])
-    
-    trades = backtest_completo(df_4h, df_1h)
-    
+
+    # BACKTEST
+    trades = backtest(df_1h)
+
+    # RESULTADOS
     log("")
     log("="*60)
-    log("RESULTADOS DEL BACKTEST v6")
+    log("RESULTADOS DEL BACKTEST v7")
     log("="*60)
-    log(f"Periodo: {df_4h.index[0].strftime('%Y-%m-%d')} -> {df_4h.index[-1].strftime('%Y-%m-%d')}")
-    log(f"Total velas 4h: {len(df_4h)}")
+    log(f"Periodo: {df_1h.index[0].strftime('%Y-%m-%d')} -> {df_1h.index[-1].strftime('%Y-%m-%d')}")
+    log(f"Total velas 1h: {len(df_1h)}")
     log(f"")
     log(f"TRADES ENCONTRADOS: {len(trades)}")
     log(f"")
-    
+
     if len(trades) == 0:
         log("NO HUBO NINGUNA SEÑAL EN ESTE PERIODO")
         log("")
         log("SUGERENCIAS:")
         log("1. Ejecutar con DEBUG=true para ver rechazos")
-        log("2. Probar DIRECCION=short para XRP bajista")
-        log("3. Probar DIRECCION=both para operar en ambas direcciones")
-        log("4. Probar otros pares: ADA, SOL, DOGE")
-        log("5. Verificar que los datos 1h cubran todo el periodo 4h")
+        log("2. Probar DIRECCION=both para operar en ambas direcciones")
+        log("3. Probar otros pares: ADA, SOL, DOGE")
     else:
         metricas = calcular_metricas(trades)
-        
+
         log("METRICAS GLOBALES:")
         log("-" * 60)
         log(f"Trades totales: {metricas['n_trades']}")
@@ -674,7 +576,7 @@ def main():
         log(f"Promedio ganador: {metricas['avg_win']:.2f}%")
         log(f"Promedio perdedor: {metricas['avg_loss']:.2f}%")
         log(f"")
-        
+
         log("DETALLE DE TRADES:")
         log("-" * 60)
         for i, t in enumerate(trades, 1):
@@ -685,10 +587,10 @@ def main():
             log(f"   Entrada: ${t['entry']:.4f} -> Salida: ${t['exit_price']:.4f}")
             log(f"   Resultado: {t['resultado']} ({t['tipo_salida']}) | P&L: {t['pnl_pct']:+.2f}%")
             log(f"   Duración: {t['velas_duracion']} velas 1h")
-            log(f"   RSI 4h: {t['rsi_4h']:.1f} | RSI 1h: {t['rsi_1h']:.1f}")
-            log(f"   Tendencia: {t.get('tendencia', 'N/A')} | Ancho canal: {t['ancho_canal']:.1f}")
+            log(f"   RSI: {t['rsi']:.1f} | Ancho canal: {t['ancho_canal']:.1f}")
+            log(f"   Tendencia: {t.get('tendencia', 'N/A')}")
             log(f"")
-    
+
     log("="*60)
     log("Backtest finalizado")
     log("="*60)
