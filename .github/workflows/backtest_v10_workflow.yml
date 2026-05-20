@@ -1,15 +1,9 @@
-- name: Ejecutar backtest y guardar resultados
-  env:
-    BITGET_SYMBOL: XRP/USDT
-    DIRECCION: both
-    LEVERAGE: '5'
-  run: |
-    python bot_rsi_canales_v10_4.py > resultados_xrp_v10_4.txt
-    echo "Backtest completado"
-    
-- name: Subir resultados
-  uses: actions/upload-artifact@v4
-  with:
-    name: resultados-xrp-backtest
-    path: resultados_xrp_v10_4.txt
 
+
+- name: Ejecutar backtest
+  env:
+    BITGET_SYMBOL: ${{ github.event.inputs.symbol || 'SOL/USDT' }}
+    DIRECCION: ${{ github.event.inputs.direccion || 'both' }}
+    LEVERAGE: '5'
+    VOLUMEN_MIN_RATIO: '1.5'
+  run: python bot_rsi_canales_v10_3.py
