@@ -1,14 +1,10 @@
 """
-BOT RSI CANALES - BACKTEST v4
+BOT RSI CANALES - BACKTEST v5
 ==============================
-Cambios fundamentales basados en análisis:
-- SL más ajustado (0.8%) para reducir pérdidas
-- TP más realista (1.5%) basado en promedio de ganadores
-- Filtro: RSI 1h < 55 en entrada (evitar sobrecompra)
-- Filtro: RSI 4h > 30 (evitar catching falling knives)
-- Filtro: ancho canal > 15 (evitar canales muy anchos)
-- Filtro: RSI 1h en ruptura debe ser < 55 (no > 60)
-- Solo 1 trade por día máximo
+Contexto: XRP en rango lateral bajista desde feb 2026
+Cambio: Estrategia adaptada a mercado bajista
+Opción A: Solo SHORT (vender rupturas de diagonal)
+Opción B: Filtro de tendencia + solo operar en dirección correcta
 """
 
 import pandas as pd
@@ -24,19 +20,26 @@ CONFIG = {
     'balance': float(os.environ.get('BALANCE', '1000')),
     'leverage': int(os.environ.get('LEVERAGE', '5')),
     'risk_per_trade': float(os.environ.get('RISK_PER_TRADE', '0.02')),
-    'sl_pct': float(os.environ.get('SL_PCT', '0.008')),      # Bajado de 1.5% a 0.8%
-    'tp_pct': float(os.environ.get('TP_PCT', '0.015')),      # Bajado de 3% a 1.5%
+    'sl_pct': float(os.environ.get('SL_PCT', '0.008')),
+    'tp_pct': float(os.environ.get('TP_PCT', '0.015')),
     'min_r2_canal': float(os.environ.get('MIN_R2_CANAL', '0.05')),
     'min_r2_diagonal': float(os.environ.get('MIN_R2_DIAGONAL', '0.10')),
     'umbral_rebote': float(os.environ.get('UMBRAL_REBOTE', '1.0')),
-    'trailing_stop_pct': 0.005,      # 0.5% trailing más ajustado
-    'breakeven_trigger': 0.008,      # BE a +0.8%
-    'time_exit_max': 20,             # Reducido a 20 velas
-    'max_rsi_1h': 55,                # NUEVO: RSI 1h máximo en entrada
-    'min_rsi_4h': 30,                # NUEVO: RSI 4h mínimo en entrada
-    'min_ancho_canal': 10,           # NUEVO: ancho mínimo del canal
-    'max_ancho_canal': 30,           # NUEVO: ancho máximo del canal
-    'cooldown_horas': 24,            # NUEVO: espera 24h entre trades
+    'trailing_stop_pct': 0.005,
+    'breakeven_trigger': 0.008,
+    'time_exit_max': 20,
+    'max_rsi_1h': 55,
+    'min_rsi_4h': 30,
+    'min_ancho_canal': 10,
+    'max_ancho_canal': 30,
+    'cooldown_horas': 24,
+    
+    # NUEVO: Dirección de la estrategia
+    # 'auto' = detecta tendencia y opera en esa dirección
+    # 'long' = solo compras (original)
+    # 'short' = solo ventas (recomendado para XRP ahora)
+    'direccion': os.environ.get('DIRECCION', 'auto'),
+    
     'debug': os.environ.get('DEBUG', 'false').lower() == 'true',
     'use_filters': os.environ.get('USE_FILTERS', 'true').lower() == 'true',
 }
@@ -68,6 +71,22 @@ def calcular_atr(df, period=14):
     low_close = np.abs(df['low'] - df['close'].shift())
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     return tr.rolling(window=period).mean()
+
+def detectar_tendencia(df_4h, idx, periodos=20):
+    """
+    Detectar tendencia del precio basada en EMAs
+    Returns: 'alcista', 'bajista', 'lateral'
+    """
+    precio = df_4h['close'].iloc[idx]
+    ema20 = df_4h['ema20'].iloc[idx]
+    ema50 = df_4h['ema50'].iloc[idx] if 'ema50' in df_4h.columns else ema20
+    
+    if precio > ema20 * 1.02 and ema20 > ema50:
+        return 'alcista'
+    elif precio < ema20 * 0.98 and ema20 < ema50:
+        return 'bajista'
+    else:
+        return 'lateral'
 
 def detectar_canal_4h(rsi_values, ventana_pivot=3, min_puntos=3,
                        pendiente_max=-0.005, diff_max=0.5, r2_min=0.05):
@@ -212,85 +231,121 @@ def detectar_ruptura_1h(rsi_values, diagonal, umbral=0.0):
     
     return False, None
 
-def simular_trade(df_1h, idx_entrada, entry_price):
+def simular_trade(df_1h, idx_entrada, entry_price, direccion='long'):
+    """
+    Simular trade en dirección específica
+    direccion: 'long' o 'short'
+    """
     if idx_entrada >= len(df_1h) - 1:
         return None
     
-    sl_price = entry_price * (1 - CONFIG['sl_pct'])
-    tp_price = entry_price * (1 + CONFIG['tp_pct'])
-    
-    # SL basado en mínimo reciente
-    min_recent = df_1h['low'].iloc[max(0, idx_entrada-5):idx_entrada].min()
-    sl_final = max(sl_price, min_recent * 0.999)
-    
-    max_price = entry_price
-    breakeven_activado = False
-    sl_trailing = sl_final
-    
-    max_velas = CONFIG['time_exit_max']
-    
-    for i in range(1, min(max_velas, len(df_1h) - idx_entrada)):
-        vela = df_1h.iloc[idx_entrada + i]
-        vela_low = vela['low']
-        vela_high = vela['high']
+    if direccion == 'long':
+        # LONG: comprar, TP arriba, SL abajo
+        sl_price = entry_price * (1 - CONFIG['sl_pct'])
+        tp_price = entry_price * (1 + CONFIG['tp_pct'])
+        min_recent = df_1h['low'].iloc[max(0, idx_entrada-5):idx_entrada].min()
+        sl_final = max(sl_price, min_recent * 0.999)
         
-        if vela_high > max_price:
-            max_price = vela_high
+        max_price = entry_price
+        breakeven_activado = False
+        sl_trailing = sl_final
         
-        ganancia_pct = (max_price - entry_price) / entry_price
-        if ganancia_pct >= CONFIG['breakeven_trigger'] and not breakeven_activado:
-            breakeven_activado = True
-            sl_trailing = entry_price * 1.001
-        
-        if breakeven_activado:
-            nuevo_sl = max_price * (1 - CONFIG['trailing_stop_pct'])
-            if nuevo_sl > sl_trailing:
-                sl_trailing = nuevo_sl
-        
-        if vela_low <= sl_trailing:
-            pnl_pct = (sl_trailing - entry_price) / entry_price * 100
-            return {
-                'resultado': 'SL',
-                'exit_price': sl_trailing,
-                'pnl_pct': pnl_pct,
-                'velas_duracion': i,
-                'fecha_salida': df_1h.index[idx_entrada + i],
-                'tipo_salida': 'trailing' if breakeven_activado else 'sl_fijo'
-            }
-        
-        if vela_high >= tp_price:
-            return {
-                'resultado': 'TP',
-                'exit_price': tp_price,
-                'pnl_pct': CONFIG['tp_pct'] * 100,
-                'velas_duracion': i,
-                'fecha_salida': df_1h.index[idx_entrada + i],
-                'tipo_salida': 'tp_fijo'
-            }
+        for i in range(1, min(CONFIG['time_exit_max'], len(df_1h) - idx_entrada)):
+            vela = df_1h.iloc[idx_entrada + i]
+            
+            if vela['high'] > max_price:
+                max_price = vela['high']
+            
+            ganancia_pct = (max_price - entry_price) / entry_price
+            if ganancia_pct >= CONFIG['breakeven_trigger'] and not breakeven_activado:
+                breakeven_activado = True
+                sl_trailing = entry_price * 1.001
+            
+            if breakeven_activado:
+                nuevo_sl = max_price * (1 - CONFIG['trailing_stop_pct'])
+                if nuevo_sl > sl_trailing:
+                    sl_trailing = nuevo_sl
+            
+            if vela['low'] <= sl_trailing:
+                pnl_pct = (sl_trailing - entry_price) / entry_price * 100
+                return {'resultado': 'SL', 'exit_price': sl_trailing, 'pnl_pct': pnl_pct,
+                        'velas_duracion': i, 'fecha_salida': df_1h.index[idx_entrada + i],
+                        'tipo_salida': 'trailing' if breakeven_activado else 'sl_fijo',
+                        'direccion': 'long'}
+            
+            if vela['high'] >= tp_price:
+                return {'resultado': 'TP', 'exit_price': tp_price, 'pnl_pct': CONFIG['tp_pct'] * 100,
+                        'velas_duracion': i, 'fecha_salida': df_1h.index[idx_entrada + i],
+                        'tipo_salida': 'tp_fijo', 'direccion': 'long'}
     
-    idx_salida = idx_entrada + min(max_velas, len(df_1h) - idx_entrada - 1)
+    else:
+        # SHORT: vender, TP abajo, SL arriba
+        sl_price = entry_price * (1 + CONFIG['sl_pct'])
+        tp_price = entry_price * (1 - CONFIG['tp_pct'])
+        max_recent = df_1h['high'].iloc[max(0, idx_entrada-5):idx_entrada].max()
+        sl_final = min(sl_price, max_recent * 1.001)
+        
+        min_price = entry_price
+        breakeven_activado = False
+        sl_trailing = sl_final
+        
+        for i in range(1, min(CONFIG['time_exit_max'], len(df_1h) - idx_entrada)):
+            vela = df_1h.iloc[idx_entrada + i]
+            
+            if vela['low'] < min_price:
+                min_price = vela['low']
+            
+            ganancia_pct = (entry_price - min_price) / entry_price
+            if ganancia_pct >= CONFIG['breakeven_trigger'] and not breakeven_activado:
+                breakeven_activado = True
+                sl_trailing = entry_price * 0.999
+            
+            if breakeven_activado:
+                nuevo_sl = min_price * (1 + CONFIG['trailing_stop_pct'])
+                if nuevo_sl < sl_trailing:
+                    sl_trailing = nuevo_sl
+            
+            if vela['high'] >= sl_trailing:
+                pnl_pct = (entry_price - sl_trailing) / entry_price * 100
+                return {'resultado': 'SL', 'exit_price': sl_trailing, 'pnl_pct': pnl_pct,
+                        'velas_duracion': i, 'fecha_salida': df_1h.index[idx_entrada + i],
+                        'tipo_salida': 'trailing' if breakeven_activado else 'sl_fijo',
+                        'direccion': 'short'}
+            
+            if vela['low'] <= tp_price:
+                return {'resultado': 'TP', 'exit_price': tp_price, 'pnl_pct': CONFIG['tp_pct'] * 100,
+                        'velas_duracion': i, 'fecha_salida': df_1h.index[idx_entrada + i],
+                        'tipo_salida': 'tp_fijo', 'direccion': 'short'}
+    
+    # Time exit
+    idx_salida = idx_entrada + min(CONFIG['time_exit_max'], len(df_1h) - idx_entrada - 1)
     exit_price = df_1h['close'].iloc[idx_salida]
-    pnl_pct = (exit_price - entry_price) / entry_price * 100
+    
+    if direccion == 'long':
+        pnl_pct = (exit_price - entry_price) / entry_price * 100
+    else:
+        pnl_pct = (entry_price - exit_price) / entry_price * 100
     
     return {
         'resultado': 'TIME_EXIT',
         'exit_price': exit_price,
         'pnl_pct': pnl_pct,
-        'velas_duracion': min(max_velas, len(df_1h) - idx_entrada - 1),
+        'velas_duracion': min(CONFIG['time_exit_max'], len(df_1h) - idx_entrada - 1),
         'fecha_salida': df_1h.index[idx_salida],
-        'tipo_salida': 'time_exit'
+        'tipo_salida': 'time_exit',
+        'direccion': direccion
     }
 
 def backtest_completo(df_4h, df_1h):
     log("="*60)
-    log("INICIANDO BACKTEST v4")
+    log("INICIANDO BACKTEST v5")
     log("="*60)
     
     trades = []
     rechazos = {
         'canal': 0, 'rebote': 0, 'diagonal': 0, 'ruptura': 0,
         'filtro_rsi_1h': 0, 'filtro_rsi_4h': 0, 'filtro_ancho': 0,
-        'filtro_cooldown': 0, 'datos_1h': 0
+        'filtro_cooldown': 0, 'filtro_tendencia': 0, 'datos_1h': 0
     }
     
     rsi_4h = df_4h['rsi'].values
@@ -299,6 +354,7 @@ def backtest_completo(df_4h, df_1h):
     closes_1h = df_1h['close'].values
     
     df_4h['ema20'] = df_4h['close'].ewm(span=20).mean()
+    df_4h['ema50'] = df_4h['close'].ewm(span=50).mean()
     df_1h['atr'] = calcular_atr(df_1h)
     df_1h['atr_avg'] = df_1h['atr'].rolling(50).mean()
     df_1h['vol_avg'] = df_1h['volume'].rolling(20).mean()
@@ -306,16 +362,36 @@ def backtest_completo(df_4h, df_1h):
     ventana_min = 50
     ultimo_trade_fecha = None
     
+    # Estadísticas de tendencia
+    tendencias = {'alcista': 0, 'bajista': 0, 'lateral': 0}
+    
     log(f"Total velas 4h: {len(df_4h)}")
     log(f"Total velas 1h: {len(df_1h)}")
     log(f"Periodo 4h: {df_4h.index[0]} -> {df_4h.index[-1]}")
     log(f"Periodo 1h: {df_1h.index[0]} -> {df_1h.index[-1]}")
+    log(f"Dirección: {CONFIG['direccion']}")
     log(f"Analizando...")
     
     for i in range(ventana_min, len(df_4h) - 1):
         fecha_4h = df_4h.index[i]
         
-        # COOLDOWN: No operar si ya hubo trade en las últimas N horas
+        # Detectar tendencia actual
+        tendencia = detectar_tendencia(df_4h, i)
+        tendencias[tendencia] += 1
+        
+        # Determinar dirección del trade
+        if CONFIG['direccion'] == 'auto':
+            direccion_trade = 'short' if tendencia == 'bajista' else 'long' if tendencia == 'alcista' else None
+        elif CONFIG['direccion'] == 'short':
+            direccion_trade = 'short'
+        else:
+            direccion_trade = 'long'
+        
+        if direccion_trade is None:
+            rechazos['filtro_tendencia'] += 1
+            continue
+        
+        # COOLDOWN
         if ultimo_trade_fecha is not None:
             horas_desde_ultimo = (fecha_4h - ultimo_trade_fecha).total_seconds() / 3600
             if horas_desde_ultimo < CONFIG['cooldown_horas']:
@@ -334,18 +410,15 @@ def backtest_completo(df_4h, df_1h):
             rechazos['rebote'] += 1
             continue
         
-        # NUEVO FILTRO: RSI 4h no debe estar demasiado bajo (evitar catching falling knives)
         if CONFIG['use_filters'] and info_4h['rsi_actual'] < CONFIG['min_rsi_4h']:
             rechazos['filtro_rsi_4h'] += 1
             continue
         
-        # NUEVO FILTRO: Ancho del canal debe estar en rango razonable
         ancho = info_4h.get('ancho_canal', 0)
         if CONFIG['use_filters'] and (ancho < CONFIG['min_ancho_canal'] or ancho > CONFIG['max_ancho_canal']):
             rechazos['filtro_ancho'] += 1
             continue
         
-        # Mapeo temporal preciso
         idx_1h_candidatos = df_1h.index.get_indexer([fecha_4h], method='nearest')
         if len(idx_1h_candidatos) == 0 or idx_1h_candidatos[0] == -1:
             continue
@@ -370,17 +443,14 @@ def backtest_completo(df_4h, df_1h):
             rechazos['ruptura'] += 1
             continue
         
-        # NUEVO FILTRO CRÍTICO: RSI 1h en ruptura no debe estar sobrecomprado
         if CONFIG['use_filters'] and info_1h['rsi_despues'] > CONFIG['max_rsi_1h']:
             rechazos['filtro_rsi_1h'] += 1
-            if CONFIG['debug']:
-                log(f"  [i={i}] RSI 1h {info_1h['rsi_despues']:.1f} > {CONFIG['max_rsi_1h']} (rechazado)")
             continue
         
         # SEÑAL ENCONTRADA
         entry_price = closes_1h[idx_1h]
         
-        resultado_trade = simular_trade(df_1h, idx_1h, entry_price)
+        resultado_trade = simular_trade(df_1h, idx_1h, entry_price, direccion_trade)
         
         if resultado_trade:
             ultimo_trade_fecha = fecha_4h
@@ -389,18 +459,21 @@ def backtest_completo(df_4h, df_1h):
                 'idx_4h': i,
                 'idx_1h': idx_1h,
                 'entry': entry_price,
-                'sl': entry_price * (1 - CONFIG['sl_pct']),
-                'tp': entry_price * (1 + CONFIG['tp_pct']),
+                'sl': entry_price * (1 - CONFIG['sl_pct']) if direccion_trade == 'long' else entry_price * (1 + CONFIG['sl_pct']),
+                'tp': entry_price * (1 + CONFIG['tp_pct']) if direccion_trade == 'long' else entry_price * (1 - CONFIG['tp_pct']),
                 'rsi_4h': info_4h['rsi_actual'],
                 'rsi_1h': info_1h['rsi_despues'],
                 'techo_canal': info_4h['techo'],
                 'suelo_canal': info_4h['suelo'],
                 'ancho_canal': ancho,
+                'tendencia': tendencia,
                 **resultado_trade
             })
     
+    log(f"")
+    log(f"Tendencias detectadas: Alcista={tendencias['alcista']}, Bajista={tendencias['bajista']}, Lateral={tendencias['lateral']}")
+    
     if CONFIG['debug'] or len(trades) < 5:
-        log(f"")
         log(f"DEBUG - Rechazos:")
         for k, v in rechazos.items():
             log(f"  {k}: {v}")
@@ -459,6 +532,10 @@ def calcular_metricas(trades, balance_inicial=1000):
     returns = [t['pnl_pct'] for t in trades]
     sharpe = np.mean(returns) / np.std(returns) * np.sqrt(252) if np.std(returns) > 0 else 0
     
+    # Métricas por dirección
+    longs = [t for t in trades if t.get('direccion') == 'long']
+    shorts = [t for t in trades if t.get('direccion') == 'short']
+    
     return {
         'n_trades': n_trades,
         'n_ganadores': n_ganadores,
@@ -476,16 +553,18 @@ def calcular_metricas(trades, balance_inicial=1000):
         'avg_win': avg_win,
         'avg_loss': avg_loss,
         'balances': balances,
+        'longs': len(longs),
+        'shorts': len(shorts),
+        'pnl_longs': sum(t['pnl_pct'] for t in longs),
+        'pnl_shorts': sum(t['pnl_pct'] for t in shorts),
     }
 
 def main():
     log("="*60)
-    log("BOT RSI CANALES - BACKTEST v4")
+    log("BOT RSI CANALES - BACKTEST v5")
     log(f"Par: {CONFIG['symbol']}")
     log(f"SL: {CONFIG['sl_pct']*100:.1f}% | TP: {CONFIG['tp_pct']*100:.1f}%")
-    log(f"Max RSI 1h: {CONFIG['max_rsi_1h']} | Min RSI 4h: {CONFIG['min_rsi_4h']}")
-    log(f"Ancho canal: {CONFIG['min_ancho_canal']}-{CONFIG['max_ancho_canal']}")
-    log(f"Cooldown: {CONFIG['cooldown_horas']}h")
+    log(f"Dirección: {CONFIG['direccion']}")
     log(f"Debug: {CONFIG['debug']} | Filtros: {CONFIG['use_filters']}")
     log("="*60)
     
@@ -519,7 +598,7 @@ def main():
     
     log("")
     log("="*60)
-    log("RESULTADOS DEL BACKTEST v4")
+    log("RESULTADOS DEL BACKTEST v5")
     log("="*60)
     log(f"Periodo: {df_4h.index[0].strftime('%Y-%m-%d')} -> {df_4h.index[-1].strftime('%Y-%m-%d')}")
     log(f"Total velas 4h: {len(df_4h)}")
@@ -532,15 +611,15 @@ def main():
         log("")
         log("SUGERENCIAS:")
         log("1. Ejecutar con DEBUG=true para ver rechazos")
-        log("2. Desactivar filtros: USE_FILTERS=false")
+        log("2. Probar DIRECCION=short para XRP bajista")
         log("3. Probar otros pares: ADA, SOL, DOGE")
-        log("4. Aumentar periodo a 6 meses")
     else:
         metricas = calcular_metricas(trades)
         
         log("METRICAS GLOBALES:")
         log("-" * 60)
         log(f"Trades totales: {metricas['n_trades']}")
+        log(f"  LONGS: {metricas['longs']} | SHORTS: {metricas['shorts']}")
         log(f"Ganadores: {metricas['n_ganadores']} | Perdedores: {metricas['n_perdedores']}")
         log(f"Win Rate: {metricas['win_rate']:.1f}%")
         log(f"Profit Factor: {metricas['profit_factor']:.2f}")
@@ -551,6 +630,7 @@ def main():
         log(f"Balance inicial: ${metricas['balance_inicial']:.2f}")
         log(f"Balance final: ${metricas['balance_final']:.2f}")
         log(f"Return total: {metricas['pnl_total_pct']:.2f}%")
+        log(f"P&L LONGS: {metricas['pnl_longs']:+.2f}% | P&L SHORTS: {metricas['pnl_shorts']:+.2f}%")
         log(f"Promedio ganador: {metricas['avg_win']:.2f}%")
         log(f"Promedio perdedor: {metricas['avg_loss']:.2f}%")
         log(f"")
@@ -559,13 +639,14 @@ def main():
         log("-" * 60)
         for i, t in enumerate(trades, 1):
             emoji = "🟢" if t['pnl_pct'] > 0 else "🔴"
+            dir_icon = "📈" if t.get('direccion') == 'long' else "📉"
             salida_icon = "⏱️" if t['resultado'] == 'TIME_EXIT' else ("🎯" if t['resultado'] == 'TP' else "🛑")
-            log(f"{emoji} #{i} | {t['fecha_entrada'].strftime('%Y-%m-%d %H:%M')} {salida_icon}")
+            log(f"{emoji} #{i} {dir_icon} | {t['fecha_entrada'].strftime('%Y-%m-%d %H:%M')} {salida_icon}")
             log(f"   Entrada: ${t['entry']:.4f} -> Salida: ${t['exit_price']:.4f}")
             log(f"   Resultado: {t['resultado']} ({t['tipo_salida']}) | P&L: {t['pnl_pct']:+.2f}%")
             log(f"   Duración: {t['velas_duracion']} velas 1h")
             log(f"   RSI 4h: {t['rsi_4h']:.1f} | RSI 1h: {t['rsi_1h']:.1f}")
-            log(f"   Ancho canal: {t['ancho_canal']:.1f}")
+            log(f"   Tendencia: {t.get('tendencia', 'N/A')} | Ancho canal: {t['ancho_canal']:.1f}")
             log(f"")
     
     log("="*60)
