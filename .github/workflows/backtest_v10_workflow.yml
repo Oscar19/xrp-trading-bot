@@ -42,6 +42,14 @@ jobs:
     - name: Instalar dependencias
       run: pip install pandas numpy ccxt scipy
       
+    - name: Sanitizar nombre de artifact
+      id: sanitize
+      run: |
+        SYMBOL="${{ github.event.inputs.symbol }}"
+        SYMBOL_SAFE="${SYMBOL//\//_}"
+        echo "artifact_name=backtest-${SYMBOL_SAFE}-${{ github.run_id }}" >> $GITHUB_OUTPUT
+        mkdir -p resultados
+      
     - name: Ejecutar backtest
       env:
         BITGET_SYMBOL: ${{ github.event.inputs.symbol }}
@@ -52,13 +60,12 @@ jobs:
         SL_PCT: ${{ github.event.inputs.sl_pct }}
         LOG_FILE: resultados/backtest_log.txt
       run: |
-        mkdir -p resultados
         python bot_rsi_canales_v10.5.py
       
     - name: Guardar logs y resultados
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: backtest-${{ github.event.inputs.symbol }}-${{ github.run_id }}
+        name: ${{ steps.sanitize.outputs.artifact_name }}
         path: resultados/
         retention-days: 30
