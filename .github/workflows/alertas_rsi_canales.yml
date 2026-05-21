@@ -2,36 +2,30 @@ name: Alertas RSI Canales v1.1
 
 on:
   schedule:
-    # Cada hora
     - cron: '0 * * * *'
   workflow_dispatch:
-    inputs:
-      symbol:
-        description: 'Activo específico (opcional, dejar vacío para todos)'
-        required: false
-        default: ''
 
 jobs:
   alertas:
     runs-on: ubuntu-latest
-
+    
     steps:
     - uses: actions/checkout@v4
-
+    
     - uses: actions/setup-python@v5
       with:
         python-version: '3.11'
-
+        
     - name: Instalar dependencias
       run: pip install pandas numpy ccxt scipy requests
-
+      
     - name: Ejecutar alertas
       env:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         VOLUMEN_MIN_RATIO: '1.2'
       run: python alertas_rsi_canales.py
-
+      
     - name: Guardar logs
       if: always()
       uses: actions/upload-artifact@v4
