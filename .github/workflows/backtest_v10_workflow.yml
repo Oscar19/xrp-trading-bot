@@ -1,4 +1,4 @@
-name: Backtest RSI v10
+name: Backtest RSI v10.5
 
 on:
   workflow_dispatch:
@@ -6,15 +6,27 @@ on:
       symbol:
         description: 'Par de trading'
         required: true
-        default: 'XRP/USDT'
-      direccion:
-        description: 'Direccion (long/short/both)'
-        required: true
-        default: 'long'
+        default: 'ADA/USDT'
       volumen_ratio:
         description: 'Ratio minimo de volumen'
         required: true
-        default: '1.5'
+        default: '1.2'
+      leverage:
+        description: 'Apalancamiento (1-20)'
+        required: true
+        default: '5'
+      balance:
+        description: 'Balance inicial USD'
+        required: true
+        default: '1000'
+      tp_pct:
+        description: 'Take Profit %'
+        required: true
+        default: '0.020'
+      sl_pct:
+        description: 'Stop Loss %'
+        required: true
+        default: '0.008'
 
 jobs:
   backtest:
@@ -33,14 +45,20 @@ jobs:
     - name: Ejecutar backtest
       env:
         BITGET_SYMBOL: ${{ github.event.inputs.symbol }}
-        DIRECCION: ${{ github.event.inputs.direccion }}
         VOLUMEN_MIN_RATIO: ${{ github.event.inputs.volumen_ratio }}
-      run: python bot_rsi_canales_v10.py
+        LEVERAGE: ${{ github.event.inputs.leverage }}
+        BALANCE: ${{ github.event.inputs.balance }}
+        TP_PCT: ${{ github.event.inputs.tp_pct }}
+        SL_PCT: ${{ github.event.inputs.sl_pct }}
+        LOG_FILE: resultados/backtest_${{ github.event.inputs.symbol }}_${{ github.run_id }}.txt
+      run: |
+        mkdir -p resultados
+        python bot_rsi_canales_v10.5.py
       
-    - name: Guardar logs
+    - name: Guardar logs y resultados
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: resultados-backtest
-        path: '*.txt'
-        retention-days: 7
+        name: backtest-${{ github.event.inputs.symbol }}-${{ github.run_id }}
+        path: resultados/
+        retention-days: 30
