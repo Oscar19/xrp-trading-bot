@@ -1,5 +1,5 @@
 """
-BOT RSI CANALES - ALERTAS v1.0
+BOT RSI CANALES - ALERTAS v1.1 (FIX)
 ==============================
 Sistema de alertas en tiempo real para ADA, SOL, XRP
 - Evalúa cada hora desde GitHub Actions
@@ -195,7 +195,11 @@ def detectar_ruptura_diagonal_long(rsi_values, diagonal, df, idx,
     momentum = rsi_1 > rsi_2
 
     if not (condicion_base and momentum):
-        return False, None
+        return False, {
+            'rsi_antes': rsi_2,
+            'rsi_despues': rsi_1,
+            'diag_valor': val_diag_1,
+        }
 
     if df is not None and 'volume' in df.columns and idx < len(df):
         volumen_actual = df['volume'].iloc[idx]
@@ -271,12 +275,17 @@ def analizar_activo(exchange, symbol, config_activo):
         volumen_lookback=CONFIG['volumen_lookback']
     )
 
-    if not ruptura:
-        print(f"  [SKIP] No hay ruptura (RSI_antes={info['rsi_antes']:.1f}, diag={info['diag_valor']:.1f})")
+    # FIX: Manejar info=None
+    if info is None:
+        print(f"  [SKIP] No hay ruptura (info=None)")
         return None
 
-    if not info['volumen_confirmado']:
-        print(f"  [SKIP] Volumen insuficiente ({info['ratio_volumen']:.1f}x)")
+    if not ruptura:
+        print(f"  [SKIP] No hay ruptura (RSI_antes={info.get('rsi_antes', 'N/A'):.1f}, diag={info.get('diag_valor', 'N/A'):.1f})")
+        return None
+
+    if not info.get('volumen_confirmado', False):
+        print(f"  [SKIP] Volumen insuficiente ({info.get('ratio_volumen', 0):.1f}x)")
         return None
 
     # ¡SEÑAL!
@@ -339,7 +348,7 @@ def formatear_alerta(señal):
 
 def main():
     print("="*60)
-    print("BOT RSI CANALES - ALERTAS v1.0")
+    print("BOT RSI CANALES - ALERTAS v1.1 (FIX)")
     print(f"Hora: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("="*60)
 
