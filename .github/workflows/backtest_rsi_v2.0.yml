@@ -1,0 +1,55 @@
+name: Backtest RSI v2.0 Combinado
+
+on:
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: 'Par de trading'
+        required: true
+        default: 'ADA/USDT'
+      leverage:
+        description: 'Apalancamiento'
+        required: true
+        default: '5'
+      balance:
+        description: 'Balance inicial'
+        required: true
+        default: '1000'
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Instalar dependencias
+      run: pip install pandas numpy ccxt scipy
+
+    - name: Sanitizar nombre
+      id: sanitize
+      run: |
+        SYMBOL="${{ github.event.inputs.symbol }}"
+        SYMBOL_SAFE="${SYMBOL//\//_}"
+        echo "artifact_name=backtest-v20-${SYMBOL_SAFE}-${{ github.run_id }}" >> $GITHUB_OUTPUT
+        mkdir -p resultados
+
+    - name: Ejecutar backtest combinado
+      env:
+        BITGET_SYMBOL: ${{ github.event.inputs.symbol }}
+        LEVERAGE: ${{ github.event.inputs.leverage }}
+        BALANCE: ${{ github.event.inputs.balance }}
+        LOG_FILE: resultados/backtest_v20_log.txt
+      run: python backtest_rsi_canales_v2.0.py
+
+    - name: Guardar resultados
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ steps.sanitize.outputs.artifact_name }}
+        path: resultados/
+        retention-days: 30
