@@ -1,12 +1,10 @@
 """
-BOT RSI CANALES - ALERTAS v3.0
+BOT RSI CANALES - ALERTAS v3.1
 ==============================
-Estrategias en PARALELO:
-1. EMA_CRUCE: Cruce alcista EMA 9/21
-2. RSI_CANALES: Ruptura de diagonal descendente en RSI
-
-Ambas se evalúan independientemente.
-Si cualquiera da señal → Alerta a Telegram.
+Mejoras:
+- Informa tendencia del activo (alcista/bajista/lateral)
+- Añade ETH/USDT
+- Estrategias en PARALELO: EMA_CRUCE + RSI_CANALES
 """
 
 import pandas as pd
@@ -29,6 +27,7 @@ ACTIVOS = {
     'ADA/USDT': {'nombre': 'ADA'},
     'SOL/USDT': {'nombre': 'SOL'},
     'XRP/USDT': {'nombre': 'XRP'},
+    'ETH/USDT': {'nombre': 'ETH'},
 }
 
 CONFIG = {
@@ -46,6 +45,7 @@ CONFIG = {
     'zona_sobreventa': 45,
     'ema_rapida': 9,
     'ema_lenta': 21,
+    'ema_tendencia': 50,       # Para detectar tendencia general
     'cooldown_horas': 8,
 }
 
@@ -101,6 +101,40 @@ def calcular_rsi(prices, period=14):
     return 100 - (100 / (1 + rs))
 
 # ============================================================================
+# TENDENCIA
+# ============================================================================
+
+def detectar_tendencia(df, idx):
+    """
+    Detecta tendencia basada en EMAs:
+    - Alcista: precio > EMA50 y EMA9 > EMA21
+    - Bajista: precio < EMA50 y EMA9 < EMA21
+    - Lateral: mixto o cerca de EMA50
+    """
+    if idx < 50:
+        return 'N/A', '⚪'
+
+    precio = df['close'].iloc[idx]
+    ema9 = df['ema9'].iloc[idx] if 'ema9' in df.columns else None
+    ema21 = df['ema21'].iloc[idx] if 'ema21' in df.columns else None
+    ema50 = df['ema50'].iloc[idx] if 'ema50' in df.columns else None
+
+    if ema50 is None:
+        return 'N/A', '⚪'
+
+    # Determinar tendencia
+    if precio > ema50 * 1.02:
+        if ema9 and ema21 and ema9 > ema21:
+            return 'Alcista fuerte', '🟢'
+        return 'Alcista', '🟩'
+    elif precio < ema50 * 0.98:
+        if ema9 and ema21 and ema9 < ema21:
+            return 'Bajista fuerte', '🔴'
+        return 'Bajista', '🟥'
+    else:
+        return 'Lateral', '⚪'
+
+# ============================================================================
 # ESTRATEGIA 1: EMA CRUCE
 # ============================================================================
 
@@ -108,20 +142,24 @@ def estrategia_ema_cruce(exchange, symbol, config_activo):
     """Estrategia EMA 9/21 cruce alcista"""
     print(f"\n  [EMA_CRUCE] {symbol}...")
 
-    df = fetch_data(exchange, symbol, CONFIG['timeframe'], limit=50)
+    df = fetch_data(exchange, symbol, CONFIG['timeframe'], limit=60)
     if df is None or len(df) < 30:
-        return None, "Sin datos"
+        return None, "Sin datos", None
 
     df['ema9'] = df['close'].ewm(span=CONFIG['ema_rapida'], adjust=False).mean()
     df['ema21'] = df['close'].ewm(span=CONFIG['ema_lenta'], adjust=False).mean()
+    df['ema50'] = df['close'].ewm(span=CONFIG['ema_tendencia'], adjust=False).mean()
 
     idx = len(df) - 1
     ema9 = df['ema9'].values
     ema21 = df['ema21'].values
 
+    # Tendencia
+    tendencia, emoji_tend = detectar_tendencia(df, idx)
+
     # Cruce alcista: ema9[-2] < ema21[-2] y ema9[-1] > ema21[-1]
     if not (ema9[idx-1] < ema21[idx-1] and ema9[idx] > ema21[idx]):
-        return None, f"Sin cruce (EMA9={ema9[idx]:.4f}, EMA21={ema21[idx]:.4f})"
+        return None, f"Sin cruce (Tendencia: {tendencia} {emoji_tend})", (tendencia, emoji_tend)
 
     # Volumen
     volumen_actual = df['volume'].iloc[idx]
@@ -129,11 +167,11 @@ def estrategia_ema_cruce(exchange, symbol, config_activo):
     ratio_volumen = volumen_actual / volumen_media if volumen_media > 0 else 0
 
     if ratio_volumen < CONFIG['volumen_min_ratio']:
-        return None, f"Volumen insuficiente ({ratio_volumen:.1f}x)"
+        return None, f"Volumen insuficiente ({ratio_volumen:.1f}x) | Tendencia: {tendencia} {emoji_tend}", (tendencia, emoji_tend)
 
     precio = df['close'].iloc[idx]
 
-    print(f"  🟢 SEÑAL EMA: {symbol} @ ${precio:.4f}")
+    print(f"  🟢 SEÑAL EMA: {symbol} @ ${precio:.4f} | Tendencia: {tendencia}")
 
     return {
         'symbol': symbol,
@@ -147,7 +185,9 @@ def estrategia_ema_cruce(exchange, symbol, config_activo):
         'volumen_confirmado': True,
         'ema9': ema9[idx],
         'ema21': ema21[idx],
-    }, "OK"
+        'tendencia': tendencia,
+        'tendencia_emoji': emoji_tend,
+    }, "OK", (tendencia, emoji_tend)
 
 # ============================================================================
 # ESTRATEGIA 2: RSI CANALES
@@ -279,17 +319,21 @@ def estrategia_rsi_canales(exchange, symbol, config_activo):
 
     df = fetch_data(exchange, symbol, CONFIG['timeframe'], limit=100)
     if df is None or len(df) < 50:
-        return None, "Sin datos"
+        return None, "Sin datos", None
 
     df['rsi'] = calcular_rsi(df['close'], period=CONFIG['rsi_period'])
+    df['ema50'] = df['close'].ewm(span=CONFIG['ema_tendencia'], adjust=False).mean()
 
     rsi_values = df['rsi'].values
     idx = len(df) - 1
     rsi_actual = rsi_values[idx]
     precio_actual = df['close'].iloc[idx]
 
+    # Tendencia
+    tendencia, emoji_tend = detectar_tendencia(df, idx)
+
     if rsi_actual >= CONFIG['zona_sobreventa']:
-        return None, f"RSI {rsi_actual:.1f} >= {CONFIG['zona_sobreventa']}"
+        return None, f"RSI {rsi_actual:.1f} >= {CONFIG['zona_sobreventa']} | Tendencia: {tendencia} {emoji_tend}", (tendencia, emoji_tend)
 
     diagonal = detectar_diagonal_maximos_rsi(
         rsi_values,
@@ -300,7 +344,7 @@ def estrategia_rsi_canales(exchange, symbol, config_activo):
     )
 
     if not diagonal:
-        return None, "No hay diagonal"
+        return None, f"No hay diagonal | Tendencia: {tendencia} {emoji_tend}", (tendencia, emoji_tend)
 
     ruptura, info = detectar_ruptura_diagonal_long(
         rsi_values, diagonal, df, idx,
@@ -310,7 +354,7 @@ def estrategia_rsi_canales(exchange, symbol, config_activo):
     )
 
     if info is None:
-        return None, "Info=None"
+        return None, f"Info=None | Tendencia: {tendencia} {emoji_tend}", (tendencia, emoji_tend)
 
     if not ruptura:
         motivo = []
@@ -318,12 +362,12 @@ def estrategia_rsi_canales(exchange, symbol, config_activo):
             motivo.append(f"RSI no cruzó diagonal")
         if not info['momentum']:
             motivo.append("Sin momentum")
-        return None, " | ".join(motivo)
+        return None, f"{' | '.join(motivo)} | Tendencia: {tendencia} {emoji_tend}", (tendencia, emoji_tend)
 
     if not info.get('volumen_confirmado', False):
-        return None, f"Volumen insuficiente ({info['ratio_volumen']:.1f}x)"
+        return None, f"Volumen insuficiente ({info['ratio_volumen']:.1f}x) | Tendencia: {tendencia} {emoji_tend}", (tendencia, emoji_tend)
 
-    print(f"  🟢 SEÑAL RSI: {symbol} @ ${precio_actual:.4f}")
+    print(f"  🟢 SEÑAL RSI: {symbol} @ ${precio_actual:.4f} | Tendencia: {tendencia}")
 
     return {
         'symbol': symbol,
@@ -333,8 +377,10 @@ def estrategia_rsi_canales(exchange, symbol, config_activo):
         'sl': precio_actual * (1 - CONFIG['sl_pct']),
         'tp': precio_actual * (1 + CONFIG['tp_pct']),
         'estrategia': 'RSI_CANALES',
+        'tendencia': tendencia,
+        'tendencia_emoji': emoji_tend,
         **info
-    }, "OK"
+    }, "OK", (tendencia, emoji_tend)
 
 # ============================================================================
 # ORQUESTADOR
@@ -354,6 +400,8 @@ def formatear_alerta(señal):
     symbol = señal['symbol']
     precio = señal['precio']
     estrategia = señal['estrategia']
+    tendencia = señal.get('tendencia', 'N/A')
+    tend_emoji = señal.get('tendencia_emoji', '⚪')
 
     sl_pct = CONFIG['sl_pct'] * 100
     tp_pct = CONFIG['tp_pct'] * 100
@@ -377,6 +425,7 @@ def formatear_alerta(señal):
     mensaje = f"""{emoji} <b>ALERTA LONG - {nombre}</b>
 
 📊 <b>{symbol}</b> {icono_est} <code>{estrategia}</code>
+{tend_emoji} <b>Tendencia:</b> {tendencia}
 💰 Precio: <code>${precio:.4f}</code>
 📈 RSI: <code>{señal['rsi']:.1f}</code>
 📊 Volumen: <code>{señal['ratio_volumen']:.1f}x</code> media
@@ -396,23 +445,40 @@ def formatear_alerta(señal):
     return mensaje
 
 def formatear_resumen(resultados, hora):
-    lineas = ["🔍 <b>Resumen Alertas v3.0</b>", ""]
+    lineas = ["🔍 <b>Resumen Alertas v3.1</b>", ""]
 
     total_señales = 0
     for symbol, estrategias in resultados.items():
-        lineas.append(f"📊 <b>{symbol}</b>:")
+        # Obtener tendencia del primer análisis disponible
+        tendencia = "N/A"
+        tend_emoji = "⚪"
+        for nombre_est, (señal, motivo) in estrategias.items():
+            if señal and 'tendencia' in señal:
+                tendencia = señal['tendencia']
+                tend_emoji = señal.get('tendencia_emoji', '⚪')
+                break
+            elif isinstance(motivo, tuple):
+                pass  # motivo es (tendencia, emoji) en algunos casos
+
+        lineas.append(f"📊 <b>{symbol}</b> {tend_emoji} {tendencia}:")
         for nombre_est, (señal, motivo) in estrategias.items():
             if señal:
                 emoji = "📈" if nombre_est == 'EMA_CRUCE' else "🟢"
                 lineas.append(f"   {emoji} {nombre_est}: <b>SEÑAL</b> @ ${señal['precio']:.4f}")
                 total_señales += 1
             else:
-                lineas.append(f"   ⚪ {nombre_est}: {motivo[:45]}")
+                # Extraer solo el mensaje, no la tupla de tendencia
+                if isinstance(motivo, tuple):
+                    msg = motivo[0] if len(motivo) > 0 else str(motivo)
+                else:
+                    msg = str(motivo)
+                lineas.append(f"   ⚪ {nombre_est}: {msg[:40]}")
         lineas.append("")
 
     lineas.append(f"📈 Total señales: {total_señales}")
     lineas.append(f"⏰ {hora.strftime('%Y-%m-%d %H:%M UTC')}")
-    lineas.append("📊 Estrategias: EMA_CRUCE + RSI_CANALES")
+    lineas.append("📊 Activos: ADA, SOL, XRP, ETH")
+    lineas.append("📈 Estrategias: EMA_CRUCE + RSI_CANALES")
 
     return "\n".join(lineas)
 
@@ -422,7 +488,8 @@ def formatear_resumen(resultados, hora):
 
 def main():
     print("="*60)
-    print("BOT RSI CANALES - ALERTAS v3.0 (PARALELO)")
+    print("BOT RSI CANALES - ALERTAS v3.1")
+    print("Tendencia + ETH añadido")
     print("Estrategias: EMA_CRUCE + RSI_CANALES")
     print(f"Hora: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("="*60)
@@ -449,7 +516,7 @@ def main():
         resultados[symbol] = {}
 
         for nombre_est, funcion in ESTRATEGIAS.items():
-            señal, motivo = funcion(exchange, symbol, config)
+            señal, motivo, tendencia_info = funcion(exchange, symbol, config)
             resultados[symbol][nombre_est] = (señal, motivo)
 
             if señal:
@@ -471,7 +538,7 @@ def main():
 
     # Test mode
     if MODO_TEST:
-        test_msg = "🧪 <b>TEST MODE v3.0</b>\n\nEstrategias paralelas activas:\n• EMA_CRUCE\n• RSI_CANALES\n\n" + hora.strftime('%H:%M UTC')
+        test_msg = "🧪 <b>TEST MODE v3.1</b>\n\nEstrategias paralelas activas:\n• EMA_CRUCE\n• RSI_CANALES\n• Tendencia incluida\n• ETH añadido\n\n" + hora.strftime('%H:%M UTC')
         enviar_telegram(test_msg)
 
     print("\n[FINALIZADO]")
