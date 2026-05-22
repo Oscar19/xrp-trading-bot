@@ -1,10 +1,12 @@
 """
-BOT RSI CANALES - ALERTAS v1.1 (FIX)
+BOT RSI CANALES - ALERTAS v3.0
 ==============================
-Sistema de alertas en tiempo real para ADA, SOL, XRP
-- Evalúa cada hora desde GitHub Actions
-- Envía señales a Telegram cuando detecta ruptura de diagonal RSI
-- Basado en estrategia v10.5.1 (LONGS ONLY)
+Estrategias en PARALELO:
+1. EMA_CRUCE: Cruce alcista EMA 9/21
+2. RSI_CANALES: Ruptura de diagonal descendente en RSI
+
+Ambas se evalúan independientemente.
+Si cualquiera da señal → Alerta a Telegram.
 """
 
 import pandas as pd
@@ -12,24 +14,21 @@ import numpy as np
 import ccxt
 import os
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime
 from scipy import stats
 
 # ============================================================================
-# CONFIGURACIÓN TELEGRAM
+# CONFIGURACIÓN
 # ============================================================================
 
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
-
-# ============================================================================
-# CONFIGURACIÓN DE ACTIVOS
-# ============================================================================
+MODO_TEST = os.environ.get('MODO_TEST', 'false').lower() == 'true'
 
 ACTIVOS = {
-    'ADA/USDT': {'min_rsi': 45, 'nombre': 'ADA'},
-    'SOL/USDT': {'min_rsi': 45, 'nombre': 'SOL'},
-    'XRP/USDT': {'min_rsi': 45, 'nombre': 'XRP'},
+    'ADA/USDT': {'nombre': 'ADA'},
+    'SOL/USDT': {'nombre': 'SOL'},
+    'XRP/USDT': {'nombre': 'XRP'},
 }
 
 CONFIG = {
@@ -44,6 +43,9 @@ CONFIG = {
     'min_puntos_diagonal': 2,
     'r2_min_diagonal': 0.10,
     'umbral_ruptura': 0.8,
+    'zona_sobreventa': 45,
+    'ema_rapida': 9,
+    'ema_lenta': 21,
     'cooldown_horas': 8,
 }
 
@@ -51,36 +53,29 @@ CONFIG = {
 # TELEGRAM
 # ============================================================================
 
-def enviar_telegram(mensaje, foto=None):
-    """Envía mensaje a Telegram. Si foto es None, envía texto."""
+def enviar_telegram(mensaje):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print(f"[ALERTA] Telegram no configurado. Mensaje: {mensaje[:100]}...")
+        print(f"[SKIP] Telegram no configurado")
         return False
 
     try:
-        if foto:
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-            files = {'photo': foto}
-            data = {'chat_id': TELEGRAM_CHAT_ID, 'caption': mensaje, 'parse_mode': 'HTML'}
-            response = requests.post(url, files=files, data=data, timeout=30)
-        else:
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-            data = {
-                'chat_id': TELEGRAM_CHAT_ID,
-                'text': mensaje,
-                'parse_mode': 'HTML',
-                'disable_web_page_preview': True
-            }
-            response = requests.post(url, json=data, timeout=30)
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        data = {
+            'chat_id': TELEGRAM_CHAT_ID,
+            'text': mensaje,
+            'parse_mode': 'HTML',
+            'disable_web_page_preview': True
+        }
+        response = requests.post(url, json=data, timeout=30)
 
         if response.status_code == 200:
             print(f"[OK] Telegram enviado")
             return True
         else:
-            print(f"[ERROR] Telegram: {response.status_code} - {response.text[:200]}")
+            print(f"[ERROR] Telegram {response.status_code}: {response.text[:200]}")
             return False
     except Exception as e:
-        print(f"[ERROR] Envío Telegram: {e}")
+        print(f"[ERROR] Telegram: {e}")
         return False
 
 # ============================================================================
@@ -106,7 +101,56 @@ def calcular_rsi(prices, period=14):
     return 100 - (100 / (1 + rs))
 
 # ============================================================================
-# DETECCIÓN DE DIAGONALES (IGUAL A v10.5.1)
+# ESTRATEGIA 1: EMA CRUCE
+# ============================================================================
+
+def estrategia_ema_cruce(exchange, symbol, config_activo):
+    """Estrategia EMA 9/21 cruce alcista"""
+    print(f"\n  [EMA_CRUCE] {symbol}...")
+
+    df = fetch_data(exchange, symbol, CONFIG['timeframe'], limit=50)
+    if df is None or len(df) < 30:
+        return None, "Sin datos"
+
+    df['ema9'] = df['close'].ewm(span=CONFIG['ema_rapida'], adjust=False).mean()
+    df['ema21'] = df['close'].ewm(span=CONFIG['ema_lenta'], adjust=False).mean()
+
+    idx = len(df) - 1
+    ema9 = df['ema9'].values
+    ema21 = df['ema21'].values
+
+    # Cruce alcista: ema9[-2] < ema21[-2] y ema9[-1] > ema21[-1]
+    if not (ema9[idx-1] < ema21[idx-1] and ema9[idx] > ema21[idx]):
+        return None, f"Sin cruce (EMA9={ema9[idx]:.4f}, EMA21={ema21[idx]:.4f})"
+
+    # Volumen
+    volumen_actual = df['volume'].iloc[idx]
+    volumen_media = df['volume'].iloc[max(0, idx - CONFIG['volumen_lookback']):idx].mean()
+    ratio_volumen = volumen_actual / volumen_media if volumen_media > 0 else 0
+
+    if ratio_volumen < CONFIG['volumen_min_ratio']:
+        return None, f"Volumen insuficiente ({ratio_volumen:.1f}x)"
+
+    precio = df['close'].iloc[idx]
+
+    print(f"  🟢 SEÑAL EMA: {symbol} @ ${precio:.4f}")
+
+    return {
+        'symbol': symbol,
+        'nombre': config_activo['nombre'],
+        'precio': precio,
+        'rsi': 0,
+        'sl': precio * (1 - CONFIG['sl_pct']),
+        'tp': precio * (1 + CONFIG['tp_pct']),
+        'estrategia': 'EMA_CRUCE',
+        'ratio_volumen': ratio_volumen,
+        'volumen_confirmado': True,
+        'ema9': ema9[idx],
+        'ema21': ema21[idx],
+    }, "OK"
+
+# ============================================================================
+# ESTRATEGIA 2: RSI CANALES
 # ============================================================================
 
 def detectar_diagonal_maximos_rsi(rsi_values, ventana_pivot=2, min_puntos=2,
@@ -198,7 +242,10 @@ def detectar_ruptura_diagonal_long(rsi_values, diagonal, df, idx,
         return False, {
             'rsi_antes': rsi_2,
             'rsi_despues': rsi_1,
-            'diag_valor': val_diag_1,
+            'diag_antes': val_diag_2,
+            'diag_despues': val_diag_1,
+            'condicion_base': condicion_base,
+            'momentum': momentum,
         }
 
     if df is not None and 'volume' in df.columns and idx < len(df):
@@ -226,17 +273,13 @@ def detectar_ruptura_diagonal_long(rsi_values, diagonal, df, idx,
         'diag_valor': val_diag_1,
     }
 
-# ============================================================================
-# ANÁLISIS POR ACTIVO
-# ============================================================================
-
-def analizar_activo(exchange, symbol, config_activo):
-    """Analiza un activo y devuelve señal si hay ruptura."""
-    print(f"\n[ANALIZANDO] {symbol}...")
+def estrategia_rsi_canales(exchange, symbol, config_activo):
+    """Estrategia ruptura diagonal RSI"""
+    print(f"\n  [RSI_CANALES] {symbol}...")
 
     df = fetch_data(exchange, symbol, CONFIG['timeframe'], limit=100)
     if df is None or len(df) < 50:
-        return None
+        return None, "Sin datos"
 
     df['rsi'] = calcular_rsi(df['close'], period=CONFIG['rsi_period'])
 
@@ -245,14 +288,9 @@ def analizar_activo(exchange, symbol, config_activo):
     rsi_actual = rsi_values[idx]
     precio_actual = df['close'].iloc[idx]
 
-    print(f"  Precio: ${precio_actual:.4f} | RSI: {rsi_actual:.1f}")
+    if rsi_actual >= CONFIG['zona_sobreventa']:
+        return None, f"RSI {rsi_actual:.1f} >= {CONFIG['zona_sobreventa']}"
 
-    # Zona RSI
-    if rsi_actual >= config_activo['min_rsi']:
-        print(f"  [SKIP] RSI {rsi_actual:.1f} >= {config_activo['min_rsi']} (no en zona sobreventa)")
-        return None
-
-    # Detectar diagonal
     diagonal = detectar_diagonal_maximos_rsi(
         rsi_values,
         ventana_pivot=CONFIG['pivot_ventana'],
@@ -262,12 +300,8 @@ def analizar_activo(exchange, symbol, config_activo):
     )
 
     if not diagonal:
-        print(f"  [SKIP] No hay diagonal válida")
-        return None
+        return None, "No hay diagonal"
 
-    print(f"  Diagonal: pendiente={diagonal['m']:.4f}, R²={diagonal['r2']:.2f}, puntos={diagonal['n_usados']}")
-
-    # Detectar ruptura
     ruptura, info = detectar_ruptura_diagonal_long(
         rsi_values, diagonal, df, idx,
         umbral_ruptura=CONFIG['umbral_ruptura'],
@@ -275,21 +309,21 @@ def analizar_activo(exchange, symbol, config_activo):
         volumen_lookback=CONFIG['volumen_lookback']
     )
 
-    # FIX: Manejar info=None
     if info is None:
-        print(f"  [SKIP] No hay ruptura (info=None)")
-        return None
+        return None, "Info=None"
 
     if not ruptura:
-        print(f"  [SKIP] No hay ruptura (RSI_antes={info.get('rsi_antes', 'N/A'):.1f}, diag={info.get('diag_valor', 'N/A'):.1f})")
-        return None
+        motivo = []
+        if not info['condicion_base']:
+            motivo.append(f"RSI no cruzó diagonal")
+        if not info['momentum']:
+            motivo.append("Sin momentum")
+        return None, " | ".join(motivo)
 
     if not info.get('volumen_confirmado', False):
-        print(f"  [SKIP] Volumen insuficiente ({info.get('ratio_volumen', 0):.1f}x)")
-        return None
+        return None, f"Volumen insuficiente ({info['ratio_volumen']:.1f}x)"
 
-    # ¡SEÑAL!
-    print(f"  [🟢 SEÑAL] Ruptura detectada!")
+    print(f"  🟢 SEÑAL RSI: {symbol} @ ${precio_actual:.4f}")
 
     return {
         'symbol': symbol,
@@ -298,18 +332,28 @@ def analizar_activo(exchange, symbol, config_activo):
         'rsi': rsi_actual,
         'sl': precio_actual * (1 - CONFIG['sl_pct']),
         'tp': precio_actual * (1 + CONFIG['tp_pct']),
+        'estrategia': 'RSI_CANALES',
         **info
-    }
+    }, "OK"
 
 # ============================================================================
-# FORMATO DE ALERTA
+# ORQUESTADOR
+# ============================================================================
+
+ESTRATEGIAS = {
+    'EMA_CRUCE': estrategia_ema_cruce,
+    'RSI_CANALES': estrategia_rsi_canales,
+}
+
+# ============================================================================
+# FORMATO ALERTAS
 # ============================================================================
 
 def formatear_alerta(señal):
-    emoji = "🟢"
     nombre = señal['nombre']
     symbol = señal['symbol']
     precio = señal['precio']
+    estrategia = señal['estrategia']
 
     sl_pct = CONFIG['sl_pct'] * 100
     tp_pct = CONFIG['tp_pct'] * 100
@@ -321,13 +365,22 @@ def formatear_alerta(señal):
     pnl_sl = -sl_pct * leverage
     pnl_tp = tp_pct * leverage
 
+    if estrategia == 'EMA_CRUCE':
+        emoji = "📈"
+        icono_est = "📊"
+        detalle = f"EMA9({señal['ema9']:.4f}) > EMA21({señal['ema21']:.4f})"
+    else:
+        emoji = "🟢"
+        icono_est = "📉"
+        detalle = f"Ruptura diagonal RSI | R²={señal['r2_diagonal']:.2f}, {señal['n_puntos']} pts"
+
     mensaje = f"""{emoji} <b>ALERTA LONG - {nombre}</b>
 
-📊 <b>{symbol}</b>
+📊 <b>{symbol}</b> {icono_est} <code>{estrategia}</code>
 💰 Precio: <code>${precio:.4f}</code>
 📈 RSI: <code>{señal['rsi']:.1f}</code>
 📊 Volumen: <code>{señal['ratio_volumen']:.1f}x</code> media
-📉 Diagonal: <code>R²={señal['r2_diagonal']:.2f}</code>, <code>{señal['n_puntos']} puntos</code>
+📉 {detalle}
 
 🎯 <b>TRADE SETUP</b>
 🟥 SL: <code>${sl_precio:.4f}</code> ({sl_pct:.1f}%)
@@ -342,20 +395,37 @@ def formatear_alerta(señal):
 
     return mensaje
 
+def formatear_resumen(resultados, hora):
+    lineas = ["🔍 <b>Resumen Alertas v3.0</b>", ""]
+
+    total_señales = 0
+    for symbol, estrategias in resultados.items():
+        lineas.append(f"📊 <b>{symbol}</b>:")
+        for nombre_est, (señal, motivo) in estrategias.items():
+            if señal:
+                emoji = "📈" if nombre_est == 'EMA_CRUCE' else "🟢"
+                lineas.append(f"   {emoji} {nombre_est}: <b>SEÑAL</b> @ ${señal['precio']:.4f}")
+                total_señales += 1
+            else:
+                lineas.append(f"   ⚪ {nombre_est}: {motivo[:45]}")
+        lineas.append("")
+
+    lineas.append(f"📈 Total señales: {total_señales}")
+    lineas.append(f"⏰ {hora.strftime('%Y-%m-%d %H:%M UTC')}")
+    lineas.append("📊 Estrategias: EMA_CRUCE + RSI_CANALES")
+
+    return "\n".join(lineas)
+
 # ============================================================================
 # MAIN
 # ============================================================================
 
 def main():
     print("="*60)
-    print("BOT RSI CANALES - ALERTAS v1.1 (FIX)")
+    print("BOT RSI CANALES - ALERTAS v3.0 (PARALELO)")
+    print("Estrategias: EMA_CRUCE + RSI_CANALES")
     print(f"Hora: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("="*60)
-
-    if not TELEGRAM_BOT_TOKEN:
-        print("[ADVERTENCIA] TELEGRAM_BOT_TOKEN no configurado")
-    if not TELEGRAM_CHAT_ID:
-        print("[ADVERTENCIA] TELEGRAM_CHAT_ID no configurado")
 
     try:
         exchange = ccxt.bitget({
@@ -368,28 +438,41 @@ def main():
         print(f"[ERROR] Conectando: {e}")
         return
 
-    señales = []
+    resultados = {}
+    todas_señales = []
+
     for symbol, config in ACTIVOS.items():
-        señal = analizar_activo(exchange, symbol, config)
-        if señal:
-            señales.append(señal)
+        print(f"\n{'='*40}")
+        print(f"ANALIZANDO: {symbol}")
+        print(f"{'='*40}")
+
+        resultados[symbol] = {}
+
+        for nombre_est, funcion in ESTRATEGIAS.items():
+            señal, motivo = funcion(exchange, symbol, config)
+            resultados[symbol][nombre_est] = (señal, motivo)
+
+            if señal:
+                todas_señales.append(señal)
 
     print(f"\n{'='*60}")
-    print(f"SEÑALES ENCONTRADAS: {len(señales)}")
+    print(f"TOTAL SEÑALES: {len(todas_señales)}")
     print(f"{'='*60}")
 
-    if señales:
-        for señal in señales:
-            mensaje = formatear_alerta(señal)
-            print(f"\n[ENVIANDO] {señal['symbol']}")
-            enviar_telegram(mensaje)
-    else:
-        print("No hay señales en este momento.")
-        # Enviar heartbeat cada 6 horas (a las 00:00, 06:00, 12:00, 18:00)
-        hora = datetime.now().hour
-        if hora % 6 == 0:
-            mensaje = f"🔍 <b>Heartbeat Alertas</b>\n\nSin señales en este momento.\nHora: {datetime.now().strftime('%H:%M')}\nActivos monitoreados: ADA, SOL, XRP"
-            enviar_telegram(mensaje)
+    # Enviar resumen SIEMPRE
+    hora = datetime.now()
+    resumen = formatear_resumen(resultados, hora)
+    enviar_telegram(resumen)
+
+    # Enviar alertas individuales
+    for señal in todas_señales:
+        mensaje = formatear_alerta(señal)
+        enviar_telegram(mensaje)
+
+    # Test mode
+    if MODO_TEST:
+        test_msg = "🧪 <b>TEST MODE v3.0</b>\n\nEstrategias paralelas activas:\n• EMA_CRUCE\n• RSI_CANALES\n\n" + hora.strftime('%H:%M UTC')
+        enviar_telegram(test_msg)
 
     print("\n[FINALIZADO]")
 
