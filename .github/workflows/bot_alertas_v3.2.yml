@@ -2,9 +2,11 @@ name: Bot Alertas RSI Canales v3.2
 
 on:
   schedule:
-    # Ejecutar cada 4 horas (alineado con timeframe 4H)
     - cron: '5 */4 * * *'
   workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   alertas:
@@ -25,4 +27,7 @@ jobs:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         MODO_TEST: ${{ github.event_name == 'workflow_dispatch' && 'true' || 'false' }}
-      run: python bot_alertas_v3.2.py
+      run: |
+        echo "TELEGRAM_BOT_TOKEN está configurado: ${{ secrets.TELEGRAM_BOT_TOKEN != '' }}"
+        echo "TELEGRAM_CHAT_ID está configurado: ${{ secrets.TELEGRAM_CHAT_ID != '' }}"
+        python bot_alertas_v3.2.py
