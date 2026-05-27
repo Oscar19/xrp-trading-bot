@@ -481,13 +481,23 @@ def backtest_estrategia(df, nombre_estrategia, config):
             ok, msg, info_div = check_rsi_divergencia(df, i, config)
 
         if not ok:
-            if "cruce" in str(msg).lower(): rechazos['cruce'] += 1
-            elif "volumen" in str(msg).lower(): rechazos['volumen'] += 1
-            elif "divergencia" in str(msg).lower() or "sin divergencia" in str(msg).lower(): rechazos['divergencia'] += 1
-            elif "diagonal" in str(msg).lower(): rechazos['diagonal'] += 1
-            elif "ruptura" in str(msg).lower(): rechazos['ruptura'] += 1
-            elif "rsi" in str(msg).lower() and ">=" in str(msg): rechazos['zona_rsi'] += 1
-            elif "sin divergencia" in str(msg).lower(): rechazos['sin_divergencia'] += 1
+            msg_lower = str(msg).lower()
+            if "cruce" in msg_lower:
+                rechazos['cruce'] = rechazos.get('cruce', 0) + 1
+            elif "volumen" in msg_lower:
+                rechazos['volumen'] = rechazos.get('volumen', 0) + 1
+            elif "sin divergencia" in msg_lower or "divergencia" in msg_lower:
+                # Usar la clave correcta según la estrategia
+                if 'sin_divergencia' in rechazos:
+                    rechazos['sin_divergencia'] += 1
+                else:
+                    rechazos['divergencia'] = rechazos.get('divergencia', 0) + 1
+            elif "diagonal" in msg_lower:
+                rechazos['diagonal'] = rechazos.get('diagonal', 0) + 1
+            elif "ruptura" in msg_lower:
+                rechazos['ruptura'] = rechazos.get('ruptura', 0) + 1
+            elif "rsi" in msg_lower and ">=" in msg_lower:
+                rechazos['zona_rsi'] = rechazos.get('zona_rsi', 0) + 1
             continue
 
         entry_price = closes[i]
