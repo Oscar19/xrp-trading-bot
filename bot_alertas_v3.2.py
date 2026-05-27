@@ -35,14 +35,20 @@ MODO_TEST = os.environ.get('MODO_TEST', 'false').lower() == 'true'
 
 # Configuracion por activo
 ACTIVOS = {
-    'ADA/USDT': {
-        'nombre': 'ADA',
+    'BTC/USDT': {
+        'nombre': 'BTC',
         'div_order': 5,
         'div_lookback': 15,
         'div_rsi_max': 35,
     },
     'ETH/USDT': {
         'nombre': 'ETH',
+        'div_order': 5,
+        'div_lookback': 15,
+        'div_rsi_max': 35,
+    },
+    'ADA/USDT': {
+        'nombre': 'ADA',
         'div_order': 5,
         'div_lookback': 15,
         'div_rsi_max': 35,
@@ -612,7 +618,7 @@ def formatear_resumen(resultados, hora):
 
     lineas.append(f"📈 Total señales: {total_señales}")
     lineas.append(f"⏰ {hora.strftime('%Y-%m-%d %H:%M UTC')}")
-    lineas.append("📊 Activos: ADA, ETH, XRP")
+    lineas.append("📊 Activos: BTC, ETH, ADA, XRP")
     lineas.append("📈 Estrategias: EMA_CRUCE + RSI_CANALES + RSI_DIVERGENCIA")
 
     return "\n".join(lineas)
@@ -689,6 +695,7 @@ def main():
                    "• RSI_CANALES (con filtro divergencia)\n"
                    "• RSI_DIVERGENCIA (nueva)\n"
                    "• Parametros por activo\n"
+                   "• BTC/ETH/ADA: div_order=5\n"
                    "• XRP: div_order=3\n"
                    "• ADA/ETH: div_order=5\n\n") + hora.strftime('%H:%M UTC')
         enviar_telegram(test_msg)
