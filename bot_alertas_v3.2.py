@@ -59,6 +59,12 @@ ACTIVOS = {
         'div_lookback': 15,
         'div_rsi_max': 35,
     },
+    'AVAX/USDT': {
+        'nombre': 'AVAX',
+        'div_order': 5,  # AVAX funciona perfecto con order=5
+        'div_lookback': 15,
+        'div_rsi_max': 35,
+    },
 }
 
 CONFIG = {
@@ -618,7 +624,7 @@ def formatear_resumen(resultados, hora):
 
     lineas.append(f"📈 Total señales: {total_señales}")
     lineas.append(f"⏰ {hora.strftime('%Y-%m-%d %H:%M UTC')}")
-    lineas.append("📊 Activos: BTC, ETH, ADA, XRP")
+    lineas.append("📊 Activos: BTC, ETH, ADA, XRP, AVAX")
     lineas.append("📈 Estrategias: EMA_CRUCE + RSI_CANALES + RSI_DIVERGENCIA")
 
     return "\n".join(lineas)
@@ -695,7 +701,7 @@ def main():
                    "• RSI_CANALES (con filtro divergencia)\n"
                    "• RSI_DIVERGENCIA (nueva)\n"
                    "• Parametros por activo\n"
-                   "• BTC/ETH/ADA: div_order=5\n"
+                   "• BTC/ETH/ADA/AVAX: div_order=5\n"
                    "• XRP: div_order=3\n"
                    "• ADA/ETH: div_order=5\n\n") + hora.strftime('%H:%M UTC')
         enviar_telegram(test_msg)
